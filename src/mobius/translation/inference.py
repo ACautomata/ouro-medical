@@ -91,8 +91,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_image(image_path: str, image_size: int = 256) -> torch.Tensor:
-    """Load image from path, supporting .nii.gz and standard image formats."""
+def load_image(image_path: str, image_size: int = 256, num_channels: int = 1) -> torch.Tensor:
+    """Load image from path, supporting .nii.gz and standard image formats.
+
+    Args:
+        image_path: Path to the image file.
+        image_size: Target spatial size (square).
+        num_channels: Number of output channels (1 for grayscale MRI, 3 for RGB).
+    """
     path = Path(image_path)
     suffix = path.suffix.lower()
 
@@ -121,8 +127,8 @@ def load_image(image_path: str, image_size: int = 256) -> torch.Tensor:
                 img_tensor, size=(image_size, image_size), mode="bilinear", align_corners=False
             )
 
-            # Tile to 3 channels for consistency
-            img_tensor = img_tensor.repeat(1, 3, 1, 1)
+            # Expand to requested channel count
+            img_tensor = img_tensor.repeat(1, num_channels, 1, 1)
 
             return img_tensor
 
@@ -131,10 +137,14 @@ def load_image(image_path: str, image_size: int = 256) -> torch.Tensor:
 
     else:
         # Standard image formats (.png, .jpg, etc.)
-        img = Image.open(str(path)).convert("RGB")
+        mode = "RGB" if num_channels == 3 else "L"
+        img = Image.open(str(path)).convert(mode)
         img = img.resize((image_size, image_size), Image.BILINEAR)
         img_array = np.array(img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+        if num_channels == 1:
+            img_tensor = torch.from_numpy(img_array).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        else:
+            img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
         return img_tensor
 
 

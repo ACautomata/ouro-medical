@@ -118,8 +118,8 @@ class NEOVisionEmbeddings(nn.Module):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
-        self.llm_embed_dim = config.llm_hidden_size[0]
-        self.downsample_factor = int(1 / config.downsample_ratio[0])
+        self.llm_embed_dim = config.llm_hidden_size
+        self.downsample_factor = int(1 / config.downsample_ratio)
         self.patch_size = config.patch_size
 
         self.patch_embedding = nn.Conv2d(
@@ -159,12 +159,12 @@ class NEOVisionEmbeddings(nn.Module):
         
     def forward(self, pixel_values: torch.FloatTensor, grid_hw=None) -> torch.Tensor:
         
-        pixel_values = pixel_values.view(  # 
+        pixel_values = pixel_values.view(
             -1,
-            3,
+            self.config.num_channels,
             self.patch_size,
             self.patch_size,
-        )   #  [28072, 768] -> [28072, 3, 16, 16]
+        )
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
         self.cos_cached_x = self.cos_cached_x.to(patch_embeds.device)
         self.sin_cached_x = self.sin_cached_x.to(patch_embeds.device)

@@ -124,8 +124,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(train_loader):
-        source = batch["source"].to(args.device)
-        target = batch["target"].to(args.device)
+        source = batch["source_image"].to(args.device)
+        target = batch["target_image"].to(args.device)
 
         # Training step
         loss = train_step(model, source, target, optimizer, scaler, args, epoch)
@@ -174,14 +174,15 @@ def validate(model, val_loader, args):
 
     with torch.no_grad():
         for batch in val_loader:
-            source = batch["source"].to(args.device)
-            target = batch["target"].to(args.device)
+            source = batch["source_image"].to(args.device)
+            target = batch["target_image"].to(args.device)
             batch_size = source.shape[0]
 
             t = sample_random_timesteps(batch_size, source.device)
 
             with autocast(enabled=args.device == "cuda"):
-                loss = model(source, target, t, return_loss=True)
+                result = model(source, target, t)
+                loss = result["loss"]
 
             total_loss += loss.item()
             num_batches += 1

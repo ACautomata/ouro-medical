@@ -73,9 +73,8 @@ class OuroForImageTranslation(PreTrainedModel):
         self.config = config
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.num_channels = config.num_channels
         self.t_eps = config.t_eps
-        self.num_inference_steps = config.num_inference_steps
+        self.num_inference_steps = config.fm_steps
         self.total_ut_steps = config.total_ut_steps
 
         # Compute patch dimension: C * patch_size * patch_size

@@ -107,9 +107,16 @@ class FlowMatchingHead(nn.Module):
     The MLP head for Flow Matching diffusion.
     """
 
-    def __init__(self, input_dim, out_dim, dim=1536, layers=12, mlp_ratio=1.0):
+    def __init__(self, input_dim, out_dim, dim=1536, layers=12, mlp_ratio=1.0, patch_size=1):
         super(FlowMatchingHead, self).__init__()
-        self.net = SimpleMLPAdaLN(input_dim=input_dim, out_dim=out_dim, dim=dim, layers=layers, mlp_ratio=mlp_ratio)
+        self.net = SimpleMLPAdaLN(
+            in_channels=input_dim,
+            model_channels=dim,
+            out_channels=out_dim,
+            z_channels=input_dim,
+            num_res_blocks=layers,
+            patch_size=patch_size,
+        )
 
     @property
     def dtype(self):
@@ -315,7 +322,7 @@ def interpolate_pos_embed(model_path, pe_key: str = "gen_pos_embed", new_len: in
     References:
     DeiT: https://github.com/facebookresearch/deit
     """
-    state_dict = torch.load(model_path, map_location="cpu")
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
 
     pos_embed_1d = state_dict[pe_key]
     _, ori_len, embed_dim = pos_embed_1d.shape

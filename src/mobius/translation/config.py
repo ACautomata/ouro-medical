@@ -102,6 +102,7 @@ class OuroMRIConfig(PretrainedConfig):
         early_exit_threshold: float = 1.0,
         fm_steps: int = 50,
         fm_cfg_guidance_scale: float = 1.0,
+        t_eps: float = 1e-6,
         rms_norm_eps: float = 1e-6,
         attention_dropout: float = 0.0,
         mlp_dropout: float = 0.0,
@@ -109,6 +110,8 @@ class OuroMRIConfig(PretrainedConfig):
         hidden_act: str = "silu",
         **kwargs,
     ):
+        super().__init__(**kwargs)
+
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_channels = num_channels
@@ -122,8 +125,7 @@ class OuroMRIConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.total_ut_steps = total_ut_steps
-        self.t_eps = 1e-6
-        self.num_inference_steps = fm_steps
+        self.t_eps = t_eps
         self.early_exit_threshold = early_exit_threshold
         self.fm_steps = fm_steps
         self.fm_cfg_guidance_scale = fm_cfg_guidance_scale
@@ -132,8 +134,6 @@ class OuroMRIConfig(PretrainedConfig):
         self.mlp_dropout = mlp_dropout
         self.initializer_range = initializer_range
         self.hidden_act = hidden_act
-
-        super().__init__(**kwargs)
 
 
 __all__ = ["OuroMRIConfig"]

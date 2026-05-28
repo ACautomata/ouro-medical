@@ -205,19 +205,8 @@ class NEOChatConfig(PretrainedConfig):
         return isinstance(self.llm_config, NEOMoELLMConfig)
 
     def to_dict(self):
-        """
-        Serializes this instance to a Python dictionary. Override the default [`~PretrainedConfig.to_dict`].
-
-        Returns:
-            `Dict[str, any]`: Dictionary of all the attributes that make up this configuration instance,
-        """
         output = copy.deepcopy(self.__dict__)
         output['vision_config'] = self.vision_config.to_dict()
         output['llm_config'] = self.llm_config.to_dict()
         output['model_type'] = self.__class__.model_type
-        output['use_backbone_lora'] = self.use_backbone_lora
-        output['use_llm_lora'] = self.use_llm_lora
-        output['downsample_ratio'] = self.downsample_ratio
-        output['template'] = self.template
-
         return output

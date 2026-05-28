@@ -15,7 +15,7 @@ from .conversation import get_conv_template
 from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
-from .modeling_fm_modules import PositionEmbedding, TimestepEmbedder, FlowMatchingHead, RMSNorm, NerfEmbedder, SimpleMLPAdaLN, ConvDecoder
+from .modeling_fm_modules import TimestepEmbedder, FlowMatchingHead, ConvDecoder
 from .utils import load_image_native, SYSTEM_MESSAGE_FOR_GEN
 
 logger = logging.get_logger(__name__)
@@ -166,7 +166,10 @@ class NEOChatModel(PreTrainedModel):
     def __init__(self, config: NEOChatConfig, vision_model=None, language_model=None, use_flash_attn=True):
         super().__init__(config)
 
-        assert version_cmp(transformers.__version__, '4.37.0', 'ge')
+        if not version_cmp(transformers.__version__, '4.37.0', 'ge'):
+            raise RuntimeError(
+                f"Transformers version >= 4.37.0 is required, found {transformers.__version__}"
+            )
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
         self.template = config.template
@@ -229,6 +232,7 @@ class NEOChatModel(PreTrainedModel):
         self.max_shift = config.max_shift
         self.base_image_seq_len = config.base_image_seq_len
         self.max_image_seq_len = config.max_image_seq_len
+        self.t_eps = config.t_eps
 
         if self.add_noise_scale_embedding:
             noise_scale_embedder = TimestepEmbedder(llm_hidden_size)
@@ -273,10 +277,11 @@ class NEOChatModel(PreTrainedModel):
         selected = (input_ids == self.img_context_token_id)
         try:
             input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-        except Exception as e:
+        except RuntimeError as e:
             vit_embeds = vit_embeds.reshape(-1, C)
-            print(f'warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, '
-                  f'vit_embeds.shape={vit_embeds.shape}')
+            logger.warning(f'Shape mismatch injecting vision embeddings: {e}, '
+                           f'input_embeds[selected].shape={input_embeds[selected].shape}, '
+                           f'vit_embeds.shape={vit_embeds.shape}')
             n_token = min(selected.sum(), vit_embeds.size(0))
             input_embeds[selected][:n_token] = input_embeds[selected][:n_token] * 0.0 + vit_embeds[:n_token]
 
@@ -336,12 +341,11 @@ class NEOChatModel(PreTrainedModel):
                    IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', verbose=False, image_counts=None):
 
         if history is not None or return_history:
-            print('Now multi-turn chat is not supported in batch_chat.')
+            logger.error('Now multi-turn chat is not supported in batch_chat.')
             raise NotImplementedError
-
         if image_counts is not None:
             num_patches_list = image_counts
-            print('Warning: `image_counts` is deprecated. Please use `num_patches_list` instead.')
+            logger.warning('`image_counts` is deprecated. Please use `num_patches_list` instead.')
 
         img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_context_token_id = img_context_token_id
@@ -370,6 +374,7 @@ class NEOChatModel(PreTrainedModel):
         input_ids = model_inputs['input_ids'].to(self.device)
         attention_mask = model_inputs['attention_mask'].to(self.device)
         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+        generation_config = dict(generation_config)
         generation_config['eos_token_id'] = eos_token_id
         generation_output = self.generate(
             pixel_values=pixel_values,
@@ -425,10 +430,7 @@ class NEOChatModel(PreTrainedModel):
         return float(image_seq_len) * m + b
 
     def _apply_time_schedule(self, t: torch.Tensor, image_seq_len: int, timestep_shift: float) -> torch.Tensor:
-        self.time_schedule = "standard"
         sigma = 1 - t
-        if timestep_shift != 1:
-            self.time_schedule = "standard"
         if self.time_schedule == "standard":
             shift = timestep_shift
             sigma = shift * sigma / (1 + (shift - 1) * sigma)
@@ -616,7 +618,7 @@ class NEOChatModel(PreTrainedModel):
                 ).view(B, L, -1)
             
         
-        v_pred = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+        v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
         return v_pred
     
     def _build_it2i_inputs(self, tokenizer, query, pixel_values=None, grid_hw=None):
@@ -634,7 +636,11 @@ class NEOChatModel(PreTrainedModel):
             input_embeds = input_embeds.reshape(B * N, C)
             input_ids = input_ids.reshape(B * N)
             selected = (input_ids == self.img_context_token_id)
-            assert selected.sum() != 0
+            if selected.sum() == 0:
+                raise ValueError(
+                    f"No image context tokens (id={self.img_context_token_id}) found in input_ids. "
+                    f"Ensure the IMG_CONTEXT_TOKEN appears in the prompt template."
+                )
             input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
             input_embeds = input_embeds.reshape(B, N, C)
 
@@ -667,7 +673,7 @@ class NEOChatModel(PreTrainedModel):
     ):
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
-        self.config.t_eps = t_eps
+        self.t_eps = t_eps
 
         if isinstance(image_size, tuple):
             image_size_list = [image_size] * max_images
@@ -676,13 +682,17 @@ class NEOChatModel(PreTrainedModel):
             if len(image_size) < max_images:
                 image_size_list += [image_size_list[-1]] * (max_images - len(image_size_list))
         else:
-            assert False, "image size should be a tuple or a list of tuple"
+            raise ValueError("image size should be a tuple or a list of tuple")
 
         if images is None:
             images =[]
 
         image_token_count = prompt.count('<image>')
-        assert len(images) >= image_token_count
+        if len(images) < image_token_count:
+            raise ValueError(
+                f"Number of images ({len(images)}) is less than the number of "
+                f"<image> tokens in the prompt ({image_token_count})"
+            )
         if len(images) > image_token_count:
             prompt = "<image>\n" * (len(images) - image_token_count) + prompt
 
@@ -1008,7 +1018,7 @@ class NEOChatModel(PreTrainedModel):
     ):
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
-        self.config.t_eps = t_eps
+        self.t_eps = t_eps
 
         if isinstance(image_size, tuple):
             image_size_list = [image_size] * max_images
@@ -1017,7 +1027,7 @@ class NEOChatModel(PreTrainedModel):
             if len(image_size) < max_images:
                 image_size_list += [image_size_list[-1]] * (max_images - len(image_size_list))
         else:
-            assert False, "image size should be a tuple or a list of tuple"
+            raise ValueError("image size should be a tuple or a list of tuple")
 
         if generation_config and hasattr(generation_config, 'max_new_tokens') and generation_config.max_new_tokens is not None:
             max_new_tokens = generation_config.max_new_tokens
@@ -1034,7 +1044,11 @@ class NEOChatModel(PreTrainedModel):
         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
 
         image_token_count = prompt.count('<image>')
-        assert len(images) >= image_token_count
+        if len(images) < image_token_count:
+            raise ValueError(
+                f"Number of images ({len(images)}) is less than the number of "
+                f"<image> tokens in the prompt ({image_token_count})"
+            )
         if len(images) > image_token_count:
             prompt = "<image>\n" * (len(images) - image_token_count) + prompt
 
@@ -1096,7 +1110,6 @@ class NEOChatModel(PreTrainedModel):
 
         generated_text = ""
         generated_images =[]
-        max_images = 10
         img_count = 0
 
         next_token = torch.argmax(outputs_cond.logits[:, -1, :], dim=-1)
@@ -1348,13 +1361,20 @@ class NEOChatModel(PreTrainedModel):
 
     @torch.no_grad()
     def it2i_generate(self, tokenizer, prompt, images, cfg_scale=1, img_cfg_scale=1, cfg_norm='none', enable_timestep_shift=True, timestep_shift=1, image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
-        assert cfg_norm in ['none', 'global', 'channel']
+        if cfg_norm not in ['none', 'global', 'channel']:
+            raise ValueError(
+                f"cfg_norm must be one of ['none', 'global', 'channel'], got '{cfg_norm}'"
+            )
 
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-        self.config.t_eps = t_eps
+        self.t_eps = t_eps
 
         image_token_count = prompt.count('<image>')
-        assert len(images) >= image_token_count
+        if len(images) < image_token_count:
+            raise ValueError(
+                f"Number of images ({len(images)}) is less than the number of "
+                f"<image> tokens in the prompt ({image_token_count})"
+            )
         if len(images) > image_token_count:
             if image_token_count == 0 and len(images) > 1:
                 prompt = "".join(f"Image-{i + 1}:<image>\n" for i in range(len(images))) + prompt
@@ -1669,11 +1689,17 @@ class NEOChatModel(PreTrainedModel):
 
     @torch.no_grad()
     def t2i_generate(self, tokenizer, prompt, cfg_scale=1, timestep_shift=1, enable_timestep_shift=True, cfg_norm='none', image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
-        assert self.concat_time_token_num == 0
-        assert cfg_norm in ['cfg_zero_star', 'global', 'none', 'channel']
+        if self.concat_time_token_num != 0:
+            raise ValueError(
+                f"concat_time_token_num must be 0 for t2i_generate, got {self.concat_time_token_num}"
+            )
+        if cfg_norm not in ['cfg_zero_star', 'global', 'none', 'channel']:
+            raise ValueError(
+                f"cfg_norm must be one of ['cfg_zero_star', 'global', 'none', 'channel'], got '{cfg_norm}'"
+            )
         merge_size = int(1 / self.downsample_ratio)
 
-        self.config.t_eps = t_eps
+        self.t_eps = t_eps
         # question_condition = f"Please generate an image based on the following description: {prompt}"
         question_condition = f"{prompt}"
         # question_condition += f"\nThe resolution of the image should be {image_size}"
@@ -1852,7 +1878,7 @@ class NEOChatModel(PreTrainedModel):
         template.system_message = self.system_message
         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
 
-        history = [] if history is None else history
+        history = [] if history is None else list(history)
         for (old_question, old_answer) in history:
             template.append_message(template.roles[0], old_question)
             template.append_message(template.roles[1], old_answer)
@@ -1872,6 +1898,7 @@ class NEOChatModel(PreTrainedModel):
         model_inputs = tokenizer(query, return_tensors='pt')
         input_ids = model_inputs['input_ids'].to(self.device)
         attention_mask = model_inputs['attention_mask'].to(self.device)
+        generation_config = dict(generation_config)
         generation_config['eos_token_id'] = eos_token_id
         generation_output = self.generate(
             pixel_values=pixel_values,
@@ -1904,8 +1931,15 @@ class NEOChatModel(PreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             **generate_kwargs,
     ) -> torch.LongTensor:
-        assert input_ids.shape[0] == 1
-        assert self.img_context_token_id is not None
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                f"generate() only supports batch_size=1, got {input_ids.shape[0]}"
+            )
+        if self.img_context_token_id is None:
+            raise ValueError(
+                "img_context_token_id is not set. Call batch_chat, interleave_gen, "
+                "it2i_generate, t2i_generate, or chat before generate()."
+            )
         indexes = self.get_thw_indexes(input_ids[0], grid_hw)
         if pixel_values is not None:
             if visual_features is not None:
@@ -1919,7 +1953,11 @@ class NEOChatModel(PreTrainedModel):
 
             input_ids = input_ids.reshape(B * N)
             selected = (input_ids == self.img_context_token_id)
-            assert selected.sum() != 0
+            if selected.sum() == 0:
+                raise ValueError(
+                    f"No image context tokens (id={self.img_context_token_id}) found in input_ids. "
+                    f"Ensure the IMG_CONTEXT_TOKEN appears in the prompt template."
+                )
             input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
 
             input_embeds = input_embeds.reshape(B, N, C)
