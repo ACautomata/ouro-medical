@@ -159,7 +159,7 @@ class OuroForImageTranslation(PreTrainedModel):
         target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
 
         # Add timestep embedding to target embeddings
-        t_emb = self.diffusion_head.timestep_embedder(t)  # [B, hidden_size]
+        t_emb = self.diffusion_head.timestep_embed(t)  # [B, hidden_size]
         t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
         target_embeds = target_embeds + t_emb
 
@@ -171,17 +171,35 @@ class OuroForImageTranslation(PreTrainedModel):
             use_cache=False,
         )
 
-        # Extract target-position hidden states
-        target_hidden = outputs.last_hidden_state[:, N_patches:, :]  # [B, N, C]
+        # Compute exit probability distribution from gates (same as OuroForCausalLM)
+        pdf_list = []
+        remaining_prob = torch.ones(B, combined_embeds.shape[1], device=device)
+        for idx, gate_tensor in enumerate(gate_list):
+            lambda_i = torch.sigmoid(gate_tensor.squeeze(-1))  # [B, 2N]
+            if idx < len(gate_list) - 1:
+                p_i = lambda_i * remaining_prob
+                remaining_prob = remaining_prob * (1.0 - lambda_i)
+            else:
+                p_i = remaining_prob
+            pdf_list.append(p_i)
 
-        # Predict x_0 from target hidden states
-        x_0_pred = self.diffusion_head(target_hidden, t)  # [B, N, C*P*P]
-        x_0_pred = x_0_pred.view(B, N_patches, C, self.patch_size, self.patch_size)
+        # Weighted x_0 prediction across UT steps
+        x_0_expected = torch.zeros(
+            B, N_patches, C, self.patch_size, self.patch_size, device=device
+        )
+        for step_idx, hidden_states in enumerate(hidden_states_list):
+            target_hidden = hidden_states[:, N_patches:, :]  # [B, N, C]
+            x_0_step = self.diffusion_head(target_hidden, t)
+            x_0_step = x_0_step.view(B, N_patches, C, self.patch_size, self.patch_size)
+            # Use target-position exit probabilities as weights
+            weight = pdf_list[step_idx][:, N_patches:]  # [B, N]
+            weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, N, 1, 1, 1]
+            x_0_expected = x_0_expected + weight * x_0_step
 
-        # Loss: MSE between predicted x_0 and ground truth target patches
-        loss = nn.functional.mse_loss(x_0_pred, target_patches)
+        # Loss: MSE between weighted prediction and ground truth target patches
+        loss = nn.functional.mse_loss(x_0_expected, target_patches)
 
-        return {"loss": loss, "x_0_pred": x_0_pred}
+        return {"loss": loss, "x_0_pred": x_0_expected}
 
     @torch.no_grad()
     def translate(
@@ -231,7 +249,7 @@ class OuroForImageTranslation(PreTrainedModel):
             target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
 
             # Add timestep embedding
-            t_emb = self.diffusion_head.timestep_embedder(t_batch)
+            t_emb = self.diffusion_head.timestep_embed(t_batch)
             t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
             target_embeds = target_embeds + t_emb
 
