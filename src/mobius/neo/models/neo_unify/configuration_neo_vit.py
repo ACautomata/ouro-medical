@@ -27,8 +27,8 @@ class NEOVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
-        self.llm_hidden_size = llm_hidden_size,
-        self.downsample_ratio = downsample_ratio,
+        self.llm_hidden_size = llm_hidden_size
+        self.downsample_ratio = downsample_ratio
         self.rope_theta_vision = rope_theta_vision
         self.max_position_embeddings_vision = max_position_embeddings_vision
         self.num_channels = num_channels

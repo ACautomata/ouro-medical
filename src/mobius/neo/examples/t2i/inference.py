@@ -9,8 +9,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-import sensenova_u1
-from sensenova_u1.utils import (
+import mobius.neo as sensenova_u1
+from mobius.neo.models.neo_unify.utils import (
     DEFAULT_IMAGE_PATCH_SIZE,
     DEFAULT_VRAM_MODE,
     InferenceProfiler,
@@ -345,7 +345,7 @@ def _build_enhancer(args: argparse.Namespace):
 
     from dotenv import load_dotenv
 
-    from sensenova_u1.prompt_enhance import PromptEnhancer
+    # from sensenova_u1.prompt_enhance import PromptEnhancer
 
     load_dotenv()
     enhancer = PromptEnhancer.from_env(style="infographic")

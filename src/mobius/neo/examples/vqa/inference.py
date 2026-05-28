@@ -7,9 +7,9 @@ from pathlib import Path
 
 import torch
 
-import sensenova_u1
-from sensenova_u1.models.neo_unify.utils import load_image_native
-from sensenova_u1.utils import (
+import mobius.neo as sensenova_u1
+from mobius.neo.models.neo_unify.utils import load_image_native
+from mobius.neo.models.neo_unify.utils import (
     DEFAULT_IMAGE_PATCH_SIZE,
     DEFAULT_VRAM_MODE,
     InferenceProfiler,

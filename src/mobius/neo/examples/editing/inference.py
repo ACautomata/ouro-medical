@@ -10,9 +10,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-import sensenova_u1
-from sensenova_u1.models.neo_unify.utils import smart_resize
-from sensenova_u1.utils import (
+import mobius.neo as sensenova_u1
+from mobius.neo.models.neo_unify.utils import smart_resize
+from mobius.neo.models.neo_unify.utils import (
     DEFAULT_IMAGE_PATCH_SIZE,
     DEFAULT_VRAM_MODE,
     InferenceProfiler,

@@ -137,6 +137,23 @@ class NEOChatConfig(PretrainedConfig):
         use_llm_lora=0,
         downsample_ratio=0.5,
         template=None,
+        concat_time_token_num=0,
+        noise_scale=1.0,
+        noise_scale_mode="none",
+        noise_scale_base_image_seq_len=256,
+        noise_scale_max_value=4.0,
+        add_noise_scale_embedding=False,
+        time_schedule="standard",
+        time_shift_type="linear",
+        base_shift=0.5,
+        max_shift=1.0,
+        base_image_seq_len=256,
+        max_image_seq_len=4096,
+        fm_head_layers=2,
+        fm_head_dim=1536,
+        fm_head_mlp_ratio=1.0,
+        use_pixel_head=False,
+        t_eps=0.02,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -148,7 +165,8 @@ class NEOChatConfig(PretrainedConfig):
         if llm_config is None:
             llm_config = {'architectures': ['Qwen3ForCausalLM']}
             logger.info('llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`).')
-        assert 'architectures' in llm_config, "Should specify architecture in llm_config"
+        if isinstance(llm_config, dict):
+            assert 'architectures' in llm_config, "Should specify architecture in llm_config"
 
         if isinstance(vision_config, dict):
             self.vision_config = NEOVisionConfig(**vision_config)
@@ -162,6 +180,24 @@ class NEOChatConfig(PretrainedConfig):
         self.downsample_ratio = downsample_ratio
         self.template = template
         self.tie_word_embeddings = self.llm_config.tie_word_embeddings
+
+        self.concat_time_token_num = concat_time_token_num
+        self.noise_scale = noise_scale
+        self.noise_scale_mode = noise_scale_mode
+        self.noise_scale_base_image_seq_len = noise_scale_base_image_seq_len
+        self.noise_scale_max_value = noise_scale_max_value
+        self.add_noise_scale_embedding = add_noise_scale_embedding
+        self.time_schedule = time_schedule
+        self.time_shift_type = time_shift_type
+        self.base_shift = base_shift
+        self.max_shift = max_shift
+        self.base_image_seq_len = base_image_seq_len
+        self.max_image_seq_len = max_image_seq_len
+        self.fm_head_layers = fm_head_layers
+        self.fm_head_dim = fm_head_dim
+        self.fm_head_mlp_ratio = fm_head_mlp_ratio
+        self.use_pixel_head = use_pixel_head
+        self.t_eps = t_eps
 
     @property
     def is_moe_llm(self) -> bool:

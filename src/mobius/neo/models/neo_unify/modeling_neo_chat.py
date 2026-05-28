@@ -175,6 +175,7 @@ class NEOChatModel(PreTrainedModel):
 
         if vision_model is not None:
             self.vision_model = vision_model
+            vision_model_mot_gen = NEOVisionModel(config.vision_config)
         else:
             self.vision_model = NEOVisionModel(config.vision_config)
             vision_model_mot_gen = NEOVisionModel(config.vision_config)
@@ -254,7 +255,6 @@ class NEOChatModel(PreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        raise NotImplementedError('forward')
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_flags = image_flags.squeeze(-1)
@@ -334,7 +334,7 @@ class NEOChatModel(PreTrainedModel):
     def batch_chat(self, tokenizer, pixel_values, questions, generation_config, num_patches_list=None,
                    history=None, return_history=False, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>',
                    IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', verbose=False, image_counts=None):
-        raise NotImplementedError('batch_chat')
+
         if history is not None or return_history:
             print('Now multi-turn chat is not supported in batch_chat.')
             raise NotImplementedError
@@ -1860,13 +1860,14 @@ class NEOChatModel(PreTrainedModel):
         template.append_message(template.roles[1], None)
         query = template.get_prompt()
 
-        if verbose and pixel_values is not None:
+        if verbose and pixel_values is not None and grid_hw is not None:
             print(f'dynamic image size: {grid_hw[0] * self.patch_size}')
 
-        for i in range(grid_hw.shape[0]):
-            num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
-            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
-            query = query.replace('<image>', image_tokens, 1)
+        if grid_hw is not None:
+            for i in range(grid_hw.shape[0]):
+                num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
+                image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+                query = query.replace('<image>', image_tokens, 1)
 
         model_inputs = tokenizer(query, return_tensors='pt')
         input_ids = model_inputs['input_ids'].to(self.device)
