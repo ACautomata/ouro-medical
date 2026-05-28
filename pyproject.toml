@@ -1,20 +1,9 @@
-# ouro-medical — Vendored dependency: ouro_looped_lm
-#
-# Configuration and model code extracted from ByteDance/Ouro-1.4B (HuggingFace).
-# Original copyright: 2024 The Qwen team (Alibaba Group), 2025 ByteDance Seed.
-# License: Apache-2.0
-#
-# This package is a vendored copy of the Ouro Looped Language Model implementation,
-# intended for use as a local dependency of the ouro-medical project.
-# Source: https://huggingface.co/ByteDance/Ouro-1.4B
-# Paper: "Scaling Latent Reasoning via Looped Language Models" (arXiv:2510.25741)
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ouro-medical"
+name = "mobius"
 version = "0.1.0"
 description = "Ouro Looped Language Model adapted for medical domain research"
 readme = "README.md"
@@ -24,6 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "transformers>=4.55.0,<4.56.0",
+    "monai>=1.4",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +23,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ouro_looped_lm"]
+packages = ["src/mobius"]
 
 [tool.ruff]
 line-length = 120

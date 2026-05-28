@@ -1,12 +1,13 @@
-# CLAUDE.md — ouro-medical
+# CLAUDE.md — mobius
 
 ## Project Overview
 
-ouro-medical 是一个基于 Ouro Looped Language Model 的医学领域研究项目。
+mobius 是一个基于 Ouro Looped Language Model 的医学领域研究项目。
 
 - **核心依赖**：[Ouro](https://huggingface.co/ByteDance/Ouro-1.4B) — ByteDance Seed 出品的循环语言模型（arXiv:2510.25741）
-- **Ouro 代码位置**：`src/ouro_looped_lm/`（vendored dependency，从 HuggingFace 提取）
+- **Ouro 代码位置**：`src/mobius/ouro/`（vendored，从 HuggingFace 提取）
 - **论文资料**：`docs/Ouro论文完整信息汇总.md`
+- **依赖**：PyTorch, Transformers, MONAI
 
 ## Architecture
 
@@ -29,7 +30,7 @@ pip install -e ".[dev]"
 
 ## Vendored Code Copyright
 
-`src/ouro_looped_lm/` 下的代码源自：
+`src/mobius/ouro/` 下的代码源自：
 - Qwen team / Alibaba Group（configuration 骨架）— Apache-2.0
 - ByteDance Seed（UT 循环机制、Exit Gate、UniversalTransformerCache）— Apache-2.0
 
