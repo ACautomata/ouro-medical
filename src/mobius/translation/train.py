@@ -1,12 +1,18 @@
-"""Training script for OuroMRI flow matching based image translation."""
+"""Training script for OuroMRI flow matching based image translation.
+
+Supports single-GPU and multi-GPU DDP training via `torchrun`.
+"""
 
 import argparse
 import os
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 from .config import OuroMRIConfig
 from .modeling_translation import OuroForImageTranslation
@@ -23,7 +29,7 @@ def parse_args():
     )
     parser.add_argument("--output_dir", type=str, required=True, help="Checkpoint output path")
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per GPU")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
@@ -32,10 +38,10 @@ def parse_args():
     )
     parser.add_argument("--save_interval", type=int, default=1, help="Checkpoint save frequency")
     parser.add_argument("--log_interval", type=int, default=10, help="Logging frequency")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision")
     return parser.parse_args()
 
 
@@ -43,6 +49,10 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def is_main():
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.0):
@@ -64,9 +74,11 @@ def save_checkpoint(model, optimizer, scheduler, epoch, args, filename=None):
     if filename is None:
         filename = f"checkpoint_epoch_{epoch}.pt"
 
+    state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": state_dict,
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "args": vars(args),
@@ -79,11 +91,10 @@ def save_checkpoint(model, optimizer, scheduler, epoch, args, filename=None):
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     """Load model checkpoint."""
-    # weights_only=False is required because checkpoints contain optimizer/scheduler state
-    # (non-tensor objects). Only load checkpoints you generated yourself.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    raw = model.module if isinstance(model, DDP) else model
+    raw.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
@@ -92,30 +103,17 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     return checkpoint.get("epoch", 0)
 
 
-def sample_random_timesteps(batch_size, device):
-    """Sample random timesteps t ∈ [0, 1] for flow matching."""
-    return torch.rand(batch_size, device=device)
-
-
-def train_step(model, source, target, optimizer, scaler, args, global_step):
+def train_step(model, source, target, scaler, grad_accum_steps, use_bf16):
     """Single training step with flow matching."""
     batch_size = source.shape[0]
+    t = torch.rand(batch_size, device=source.device)
 
-    # Sample random timesteps t ∈ [0, 1]
-    t = sample_random_timesteps(batch_size, source.device)
-
-    # Forward pass with mixed precision
-    with autocast(enabled=args.device.type == "cuda"):
+    with autocast("cuda", enabled=use_bf16, dtype=torch.bfloat16 if use_bf16 else torch.float32):
         result = model(source, target, t)
-        loss = result["loss"]
+        loss = result["loss"] / grad_accum_steps
 
-    # Scale loss for gradient accumulation
-    scaled_loss = loss / args.gradient_accumulation_steps
-
-    # Backward pass
-    scaler.scale(scaled_loss).backward()
-
-    return loss.item()
+    scaler.scale(loss).backward()
+    return loss.item() * grad_accum_steps
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, writer=None):
@@ -123,23 +121,22 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
     model.train()
     total_loss = 0.0
     num_batches = 0
+    use_bf16 = args.bf16
+
+    if dist.is_initialized():
+        train_loader.sampler.set_epoch(epoch)
 
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(train_loader):
-        source = batch["source_image"].to(args.device)
-        target = batch["target_image"].to(args.device)
+        source = batch["source_image"].cuda(non_blocking=True)
+        target = batch["target_image"].cuda(non_blocking=True)
 
-        # Training step
-        loss = train_step(model, source, target, optimizer, scaler, args, epoch)
+        loss = train_step(model, source, target, scaler, args.gradient_accumulation_steps, use_bf16)
 
-        # Gradient accumulation
         if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-            # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            # Optimizer step
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -148,8 +145,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
         total_loss += loss
         num_batches += 1
 
-        # Logging
-        if batch_idx % args.log_interval == 0:
+        if is_main() and batch_idx % args.log_interval == 0:
             avg_loss = total_loss / max(num_batches, 1)
             current_lr = scheduler.get_last_lr()[0]
             print(
@@ -169,103 +165,105 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
     return total_loss / max(num_batches, 1)
 
 
-def validate(model, val_loader, args):
-    """Validation step."""
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for batch in val_loader:
-            source = batch["source_image"].to(args.device)
-            target = batch["target_image"].to(args.device)
-            batch_size = source.shape[0]
-
-            t = sample_random_timesteps(batch_size, source.device)
-
-            with autocast(enabled=args.device.type == "cuda"):
-                result = model(source, target, t)
-                loss = result["loss"]
-
-            total_loss += loss.item()
-            num_batches += 1
-
-    return total_loss / max(num_batches, 1)
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # Setup device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    args.device = device
-    print(f"Using device: {device}")
+    # DDP setup
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize model
+    if is_main():
+        print(f"Rank {rank}/{world_size}, device: {device}")
+
+    # Model
     config = OuroMRIConfig()
-    model = OuroForImageTranslation(config)
-    model.to(device)
+    model = OuroForImageTranslation(config).to(device)
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank])
 
-    # Initialize optimizer (AdamW)
+    raw_model = model.module if isinstance(model, DDP) else model
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    if is_main():
+        print(f"Model params: {n_params:,} ({n_params/1e6:.1f}M)")
+
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
 
-    # Calculate training steps
+    # Dataset & DataLoader
     train_dataset = BraTS2023Dataset(
         args.data_root, subtypes=args.subtypes, split="train",
     )
+    sampler = DistributedSampler(train_dataset, shuffle=True) if dist.is_initialized() else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        drop_last=True,
     )
-    num_training_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
 
-    # Scheduler (cosine with warmup)
+    # Scheduler
+    steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    num_training_steps = steps_per_epoch * args.epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, args.warmup_steps, num_training_steps
     )
 
-    # Mixed precision scaler
-    scaler = GradScaler(enabled=args.device.type == "cuda")
+    # Scaler (BF16 doesn't need GradScaler)
+    scaler = GradScaler("cuda", enabled=not args.bf16)
 
-    # TensorBoard writer
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))
+    # TensorBoard (rank 0 only)
+    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs")) if is_main() else None
 
-    # Resume from checkpoint
+    # Resume
     start_epoch = 0
     if args.resume is not None:
-        print(f"Resuming from checkpoint: {args.resume}")
+        if is_main():
+            print(f"Resuming from checkpoint: {args.resume}")
         start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler)
-        print(f"Resumed from epoch {start_epoch}")
+        if is_main():
+            print(f"Resumed from epoch {start_epoch}")
+
+    if is_main():
+        print(f"Dataset: {len(train_dataset)} slices, {steps_per_epoch} steps/epoch")
+        print(f"Effective batch size: {args.batch_size * world_size * args.gradient_accumulation_steps}")
+        print(f"Starting training for {args.epochs} epochs...")
 
     # Training loop
-    print(f"Starting training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        if is_main():
+            print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        # Train one epoch
         train_loss = train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, writer)
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
+        if is_main():
+            print(f"Epoch {epoch + 1} - Average Loss: {train_loss:.4f}")
+            writer.add_scalar("train/epoch_loss", train_loss, epoch)
+
+        if is_main() and (epoch + 1) % args.save_interval == 0:
             checkpoint_path = save_checkpoint(model, optimizer, scheduler, epoch + 1, args)
             print(f"Saved checkpoint: {checkpoint_path}")
 
-        # Log epoch metrics
-        print(f"Epoch {epoch + 1} - Average Loss: {train_loss:.4f}")
-        writer.add_scalar("train/epoch_loss", train_loss, epoch)
-        writer.add_scalar("train/epoch", epoch + 1, epoch)
+    if is_main():
+        save_checkpoint(model, optimizer, scheduler, args.epochs, args, filename="final_model.pt")
+        print("Training complete.")
+        writer.close()
 
-    # Final checkpoint
-    final_checkpoint = save_checkpoint(model, optimizer, scheduler, args.epochs, args, filename="final_model.pt")
-    print(f"Training complete. Final model saved to: {final_checkpoint}")
-
-    writer.close()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
