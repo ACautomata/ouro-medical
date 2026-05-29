@@ -4,9 +4,7 @@ Translates source MRI to target contrast using trained OuroMRI model.
 """
 
 import argparse
-import glob
 import logging
-import os
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +13,6 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-from .config import OuroMRIConfig
 from .modeling_translation import OuroForImageTranslation
 
 logging.basicConfig(level=logging.INFO)
@@ -402,7 +399,6 @@ def main():
 
     # Load model from checkpoint
     logger.info(f"Loading model from: {args.checkpoint_path}")
-    config = OuroMRIConfig.from_pretrained(args.checkpoint_path)
     model = OuroForImageTranslation.from_pretrained(args.checkpoint_path)
     model.to(device)
     model.eval()

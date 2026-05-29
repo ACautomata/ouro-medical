@@ -1,6 +1,5 @@
 from typing import List, Optional, Tuple, Union
 import math
-import os
 import torch.utils.checkpoint
 from torch import nn
 import transformers

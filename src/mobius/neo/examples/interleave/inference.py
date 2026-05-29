@@ -467,7 +467,7 @@ def main() -> None:
         input_images = _load_input_images(args.image)
         w, h = _resolve_image_size(input_images, fallback_w, fallback_h)
         # _set_seed(args.seed)
-        with profiler.time_generate(w, h, 1) as gen:
+        with profiler.time_generate(w, h, 1):
             text, images = engine.generate(
                 args.prompt,
                 input_images=input_images,
@@ -524,7 +524,7 @@ def main() -> None:
             think_mode = bool(sample.get("think_mode", args.think_mode))
             # _set_seed(int(sample.get("seed", args.seed)))
 
-            with profiler.time_generate(w, h, 1) as gen:
+            with profiler.time_generate(w, h, 1):
                 text, images = engine.generate(
                     prompt,
                     input_images=input_images,

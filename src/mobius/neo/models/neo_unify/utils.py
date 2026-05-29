@@ -144,7 +144,6 @@ class InferenceProfiler:
     def report(self):
         if not self.enabled:
             return
-        import time
         avg_time = sum(self.generate_times) / len(self.generate_times) if self.generate_times else 0
         print(f"Average generation time: {avg_time:.3f}s")
 

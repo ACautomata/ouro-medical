@@ -351,7 +351,6 @@ class OuroImageBackbone(PreTrainedModel):
         """
         B, seq_len, C = inputs_embeds.shape
         device = inputs_embeds.device
-        dtype = inputs_embeds.dtype
 
         # Position IDs: sequential positions across the concatenated sequence
         past_seen_tokens = (

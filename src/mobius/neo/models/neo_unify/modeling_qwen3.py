@@ -5,7 +5,6 @@ import torch._dynamo
 from torch import nn
 
 import copy
-import math
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin

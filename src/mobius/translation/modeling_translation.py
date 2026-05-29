@@ -257,16 +257,33 @@ class OuroForImageTranslation(PreTrainedModel):
 
             # Run backbone
             combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)
-            outputs, _, _ = self.backbone(
+            outputs, hidden_states_list, gate_list = self.backbone(
                 inputs_embeds=combined_embeds,
                 attention_mask=None,
                 use_cache=False,
             )
 
-            # Predict x_0
-            target_hidden = outputs.last_hidden_state[:, N_patches:, :]
-            x_0_pred = self.diffusion_head(target_hidden, t_batch)
-            x_0_pred = x_0_pred.view(B, N_patches, C, self.patch_size, self.patch_size)
+            # Compute exit probability distribution from gates (same as training forward)
+            pdf_list = []
+            remaining_prob = torch.ones(B, combined_embeds.shape[1], device=device)
+            for idx, gate_tensor in enumerate(gate_list):
+                lambda_i = torch.sigmoid(gate_tensor.squeeze(-1))  # [B, 2N]
+                if idx < len(gate_list) - 1:
+                    p_i = lambda_i * remaining_prob
+                    remaining_prob = remaining_prob * (1.0 - lambda_i)
+                else:
+                    p_i = remaining_prob
+                pdf_list.append(p_i)
+
+            # Weighted x_0 prediction across UT steps (matches training objective)
+            x_0_pred = torch.zeros(B, N_patches, C, self.patch_size, self.patch_size, device=device)
+            for step_idx, hidden_states in enumerate(hidden_states_list):
+                target_hidden = hidden_states[:, N_patches:, :]  # [B, N, C]
+                x_0_step = self.diffusion_head(target_hidden, t_batch)
+                x_0_step = x_0_step.view(B, N_patches, C, self.patch_size, self.patch_size)
+                weight = pdf_list[step_idx][:, N_patches:]  # [B, N]
+                weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, N, 1, 1, 1]
+                x_0_pred = x_0_pred + weight * x_0_step
 
             # Velocity: v = dx/dt = (x_t - x_0) / t
             denom = t.clamp_min(self.t_eps)

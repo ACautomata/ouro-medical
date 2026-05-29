@@ -2,10 +2,8 @@
 
 import argparse
 import os
-from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
@@ -102,7 +100,7 @@ def train_step(model, source, target, optimizer, scaler, args, global_step):
     t = sample_random_timesteps(batch_size, source.device)
 
     # Forward pass with mixed precision
-    with autocast(enabled=args.device == "cuda"):
+    with autocast(enabled=args.device.type == "cuda"):
         result = model(source, target, t)
         loss = result["loss"]
 
@@ -180,7 +178,7 @@ def validate(model, val_loader, args):
 
             t = sample_random_timesteps(batch_size, source.device)
 
-            with autocast(enabled=args.device == "cuda"):
+            with autocast(enabled=args.device.type == "cuda"):
                 result = model(source, target, t)
                 loss = result["loss"]
 
@@ -226,7 +224,7 @@ def main():
     )
 
     # Mixed precision scaler
-    scaler = GradScaler(enabled=args.device == "cuda")
+    scaler = GradScaler(enabled=args.device.type == "cuda")
 
     # TensorBoard writer
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))

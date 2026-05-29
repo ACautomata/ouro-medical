@@ -4,8 +4,6 @@ import torch.nn as nn
 import math
 from functools import lru_cache
 
-from torch.utils.checkpoint import checkpoint
-
 
 def modulate(x, shift, scale=None):
     if shift is None:

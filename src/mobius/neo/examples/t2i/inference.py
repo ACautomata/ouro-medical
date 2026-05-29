@@ -344,8 +344,13 @@ def _build_enhancer(args: argparse.Namespace):
     import asyncio
 
     from dotenv import load_dotenv
-
-    # from sensenova_u1.prompt_enhance import PromptEnhancer
+    try:
+        from sensenova_u1.prompt_enhance import PromptEnhancer  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(
+            "--enhance requires the optional SenseNova-U1 prompt enhancement adapter "
+            "(sensenova_u1.prompt_enhance.PromptEnhancer)."
+        ) from e
 
     load_dotenv()
     enhancer = PromptEnhancer.from_env(style="infographic")

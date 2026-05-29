@@ -91,7 +91,7 @@ def test_loss_decreases_over_multiple_steps():
         optimizer.zero_grad()
         losses.append(loss.item())
 
-    assert all(torch.isfinite(torch.tensor(l)) for l in losses), "NaN/Inf in losses"
+    assert all(torch.isfinite(torch.tensor(loss_value)) for loss_value in losses), "NaN/Inf in losses"
     # Over 20 steps with AdamW on a single sample, loss should trend down
     assert losses[-1] < losses[0], (
         f"Loss did not decrease: first={losses[0]:.4f}, last={losses[-1]:.4f}"
