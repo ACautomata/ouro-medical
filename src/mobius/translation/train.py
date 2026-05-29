@@ -101,9 +101,6 @@ def main():
     # Compute exact number of optimizer steps for scheduler
     grad_accum = train_cfg.get("gradient_accumulation_steps", 4)
     batch_size = train_cfg["batch_size"]
-    steps_per_epoch = math.ceil(len(train_dataset) / batch_size) // grad_accum
-    total_training_steps = steps_per_epoch * train_cfg["epochs"]
-    warmup_steps = min(train_cfg.get("warmup_steps", 1000), total_training_steps // 10)
 
     def warmup_cosine_lr_lambda(step):
         if step < warmup_steps:
@@ -149,6 +146,10 @@ def main():
         pin_memory=True,
         drop_last=False,
     )
+
+    steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
+    total_training_steps = steps_per_epoch * train_cfg["epochs"]
+    warmup_steps = min(train_cfg.get("warmup_steps", 1000), total_training_steps // 10)
 
     data = spt.data.DataModule(train=train_loader, val=val_loader)
 
