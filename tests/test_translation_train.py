@@ -154,6 +154,25 @@ def test_translate_matches_training():
     assert mae < 0.1, f"translate output too far from target: MAE={mae:.4f}"
 
 
+def test_batch_forward():
+    """Forward pass with batch_size=2 should work (grid_hw repeated per image)."""
+    config = _tiny_config()
+    model = OuroForImageTranslation(config)
+    model.train()
+
+    source = torch.randn(2, 1, 32, 32)
+    target = torch.randn(2, 1, 32, 32)
+    t = torch.rand(2)
+
+    result = model(source, target, t)
+    loss = result["loss"]
+
+    assert torch.isfinite(loss), f"Batch forward loss not finite: {loss.item()}"
+    loss.backward()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer.step()
+
+
 if __name__ == "__main__":
     import sys
     slow = "--slow" in sys.argv
@@ -164,6 +183,10 @@ if __name__ == "__main__":
 
     print("Running test_loss_decreases_over_multiple_steps ...")
     test_loss_decreases_over_multiple_steps()
+    print("PASSED\n")
+
+    print("Running test_batch_forward ...")
+    test_batch_forward()
     print("PASSED\n")
 
     if slow:

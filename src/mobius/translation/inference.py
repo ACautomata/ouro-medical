@@ -100,9 +100,9 @@ def load_image(image_path: str, image_size: int = 256, num_channels: int = 1) ->
         num_channels: Number of output channels (1 for grayscale MRI, 3 for RGB).
     """
     path = Path(image_path)
-    suffix = path.suffix.lower()
+    is_nifti = path.name.endswith(".nii.gz") or path.suffix == ".nii"
 
-    if suffix == ".nii.gz":
+    if is_nifti:
         try:
             import nibabel as nib
 
@@ -152,7 +152,7 @@ def save_image(tensor: torch.Tensor, output_path: str, normalize: bool = True):
     """Save tensor as image, supporting both .nii.gz and standard formats."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
+    is_nifti = path.name.endswith(".nii.gz") or path.suffix == ".nii"
 
     # Move to CPU and convert to numpy
     img = tensor.detach().cpu()
@@ -166,7 +166,7 @@ def save_image(tensor: torch.Tensor, output_path: str, normalize: bool = True):
 
     img_np = img.permute(1, 2, 0).numpy()  # [H, W, C]
 
-    if suffix == ".nii.gz":
+    if is_nifti:
         try:
             import nibabel as nib
 

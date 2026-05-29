@@ -107,12 +107,13 @@ class OuroForImageTranslation(PreTrainedModel):
 
         self.post_init()
 
-    def _get_grid_hw(self, image_shape: tuple[int, int]) -> torch.Tensor:
-        """Compute (H, W) patch grid for given image shape."""
+    def _get_grid_hw(self, image_shape: tuple[int, int], batch_size: int = 1) -> torch.Tensor:
+        """Compute (H, W) patch grid for given image shape, repeated per image."""
         H, W = image_shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
-        return torch.tensor([[h_patches, w_patches]], device=self.device, dtype=torch.long)
+        grid = torch.tensor([[h_patches, w_patches]], device=self.device, dtype=torch.long)
+        return grid.expand(batch_size, -1)
 
     def forward(
         self,
@@ -133,7 +134,7 @@ class OuroForImageTranslation(PreTrainedModel):
         """
         B, C, H, W = source_image.shape
         device = source_image.device
-        grid_hw = self._get_grid_hw((H, W))
+        grid_hw = self._get_grid_hw((H, W), batch_size=B)
 
         if t is None:
             t = torch.rand(B, device=device)
@@ -221,7 +222,7 @@ class OuroForImageTranslation(PreTrainedModel):
         """
         B, C, H, W = source_image.shape
         device = source_image.device
-        grid_hw = self._get_grid_hw((H, W))
+        grid_hw = self._get_grid_hw((H, W), batch_size=B)
         num_steps = num_steps if num_steps is not None else self.num_inference_steps
 
         # Encode source image once
