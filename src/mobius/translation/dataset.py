@@ -1,11 +1,11 @@
 """BraTS2023 dataset loader for MRI contrast translation.
 
 Handles raw NIfTI (.nii.gz) files from the official BraTS2023 challenge data.
+Uses the official TrainingData and ValidationData directory splits.
 Supports all subtypes: GLI, MEN, MET, PED, SSA.
 """
 
 import os
-import random
 from functools import lru_cache
 from typing import Optional
 
@@ -25,12 +25,25 @@ BRATS_SUFFIX_MAP = {
 AVAILABLE_SUBTYPES = ["GLI", "MEN", "MET", "PED", "SSA"]
 
 
-def _discover_brats_dirs(data_root: str, subtypes: list[str]) -> list[str]:
-    """Find all BraTS2023 training directories for the given subtypes."""
+def _discover_brats_dirs(
+    data_root: str, subtypes: list[str], split: str = "train"
+) -> list[str]:
+    """Find BraTS2023 directories for the given subtypes and split.
+
+    BraTS2023 organizes data as:
+        {data_root}/BraTS-{subtype}-00000-000...TrainingData/{patient_dirs}/
+        {data_root}/BraTS-{subtype}-00000-000...ValidationData/{patient_dirs}/
+
+    Args:
+        data_root: path to BraTS2023 root directory
+        subtypes: list of BraTS subtypes to include
+        split: "train" → TrainingData, "val" → ValidationData
+    """
+    dir_marker = "TrainingData" if split == "train" else "ValidationData"
     dirs = []
     for st in subtypes:
         for entry in os.listdir(data_root):
-            if st in entry and "TrainingData" in entry and not entry.endswith(".zip"):
+            if st in entry and dir_marker in entry and not entry.endswith(".zip"):
                 full = os.path.join(data_root, entry)
                 if os.path.isdir(full):
                     dirs.append(full)
@@ -61,11 +74,10 @@ class BraTS2023Dataset(Dataset):
     """BraTS2023 2D slice dataset for MRI contrast translation.
 
     Loads raw NIfTI volumes from BraTS2023, extracts axial slices,
-    and pairs source/target contrasts. Supports multiple subtypes.
+    and pairs source/target contrasts. Uses the official Training/Validation
+    directory split rather than random splitting.
 
     Volumes are cached in a per-worker LRU cache to avoid redundant I/O.
-    With ~2600 patients and 2 contrasts per volume (~36MB each in float32),
-    peak RAM per worker is bounded by lru_cache_size.
 
     Args:
         data_root: path to BraTS2023 root (containing subtype directories)
@@ -74,9 +86,7 @@ class BraTS2023Dataset(Dataset):
         target_contrast: target modality
         slice_range: (start, end) slice indices (default: middle 60%)
         normalize: "minmax", "zscore", or None
-        split: "train" or "val"
-        val_ratio: fraction of patients for validation
-        seed: random seed for train/val split
+        split: "train" (TrainingData) or "val" (ValidationData)
         lru_cache_size: max cached volumes per worker (default 64)
     """
 
@@ -89,8 +99,6 @@ class BraTS2023Dataset(Dataset):
         slice_range: Optional[tuple[int, int]] = None,
         normalize: Optional[str] = "minmax",
         split: str = "train",
-        val_ratio: float = 0.2,
-        seed: int = 42,
         lru_cache_size: int = 64,
     ):
         super().__init__()
@@ -101,44 +109,37 @@ class BraTS2023Dataset(Dataset):
 
         self._load_volume = lru_cache(maxsize=lru_cache_size)(self._load_volume_uncached)
 
-        subtype_dirs = _discover_brats_dirs(data_root, subtypes or AVAILABLE_SUBTYPES)
+        subtype_dirs = _discover_brats_dirs(
+            data_root, subtypes or AVAILABLE_SUBTYPES, split=split
+        )
         if not subtype_dirs:
+            split_label = "TrainingData" if split == "train" else "ValidationData"
             raise FileNotFoundError(
-                f"No BraTS2023 training directories found in {data_root}"
+                f"No BraTS2023 {split_label} directories found in {data_root}"
             )
 
         # Build (src_path, tgt_path, slice_idx) tuples
         self.samples: list[tuple[str, str, int]] = []
-        patient_entries = []
         for sdir in subtype_dirs:
             for entry in sorted(os.listdir(sdir)):
                 full = os.path.join(sdir, entry)
-                if os.path.isdir(full):
-                    patient_entries.append(full)
+                if not os.path.isdir(full):
+                    continue
 
-        random.seed(seed)
-        random.shuffle(patient_entries)
-        n_val = max(1, int(len(patient_entries) * val_ratio))
-        if split == "val":
-            patient_entries = patient_entries[:n_val]
-        else:
-            patient_entries = patient_entries[n_val:]
+                fmap = _map_contrast_files(full)
+                src_file = fmap.get(self.source_contrast)
+                tgt_file = fmap.get(self.target_contrast)
+                if src_file is None or tgt_file is None:
+                    continue
 
-        for pdir in patient_entries:
-            fmap = _map_contrast_files(pdir)
-            src_file = fmap.get(self.source_contrast)
-            tgt_file = fmap.get(self.target_contrast)
-            if src_file is None or tgt_file is None:
-                continue
+                n_slices = _get_n_slices(src_file)
+                if slice_range is not None:
+                    start, end = max(0, slice_range[0]), min(n_slices, slice_range[1])
+                else:
+                    start, end = int(n_slices * 0.2), int(n_slices * 0.8)
 
-            n_slices = _get_n_slices(src_file)
-            if slice_range is not None:
-                start, end = max(0, slice_range[0]), min(n_slices, slice_range[1])
-            else:
-                start, end = int(n_slices * 0.2), int(n_slices * 0.8)
-
-            for s in range(start, end):
-                self.samples.append((src_file, tgt_file, s))
+                for s in range(start, end):
+                    self.samples.append((src_file, tgt_file, s))
 
     @staticmethod
     def _load_volume_uncached(path: str) -> np.ndarray:

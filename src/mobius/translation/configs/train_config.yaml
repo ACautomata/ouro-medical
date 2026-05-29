@@ -1,0 +1,40 @@
+# OuroMRI Training Configuration
+# Use with: python -m mobius.translation.train --config configs/train_config.yaml
+
+data:
+  data_root: /path/to/BraTS2023  # Root containing BraTS-*TrainingData and BraTS-*ValidationData dirs
+  subtypes: [GLI, MEN, MET, PED, SSA]
+  source_contrast: t1
+  target_contrast: t2
+
+model:
+  image_size: 256
+  patch_size: 16
+  num_channels: 1
+  hidden_size: 1024
+  intermediate_size: 4096
+  num_hidden_layers: 16
+  num_attention_heads: 16
+  num_key_value_heads: 16
+  ve_hidden_size: 1024
+  downsample_ratio: 1.0
+  total_ut_steps: 4
+  fm_steps: 50
+
+training:
+  epochs: 100
+  batch_size: 2
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  gradient_accumulation_steps: 4
+  bf16: true
+  seed: 42
+  num_workers: 4
+  output_dir: outputs/
+  val_interval: 10        # Run validation every N epochs
+  save_interval: 1        # Save checkpoint every N epochs
+  log_interval: 10        # Log every N steps
+
+report:
+  path: outputs/report.log  # Path for training+validation report log
+  n_samples: 4              # Number of validation samples to print
