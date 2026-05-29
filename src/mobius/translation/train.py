@@ -7,7 +7,8 @@ Configure via YAML config file — see configs/train_config.yaml for reference.
 import argparse
 import math
 
-import lightning as pl
+import lightning as L
+import lightning.pytorch.callbacks as pl_callbacks
 import torch
 import torch.nn.functional as F
 import yaml
@@ -73,7 +74,7 @@ def main():
     report_cfg = cfg.get("report", {})
 
     # Seed
-    pl.seed_everything(train_cfg.get("seed", 42), workers=True)
+    L.seed_everything(train_cfg.get("seed", 42), workers=True)
 
     # Model
     model = build_model(model_cfg)
@@ -163,7 +164,7 @@ def main():
         ValidationMetricsCallback(),
         SampleVisualizationCallback(n_samples=n_val_samples),
         ReportGeneratorCallback(report_path=report_path),
-        pl.callbacks.ModelCheckpoint(
+        pl_callbacks.ModelCheckpoint(
             dirpath=train_cfg.get("output_dir", "outputs/checkpoints"),
             filename="ouro-mri-{epoch:03d}",
             every_n_epochs=train_cfg.get("save_interval", 1),
@@ -172,7 +173,7 @@ def main():
     ]
 
     # Trainer
-    trainer = pl.Trainer(
+    trainer = L.Trainer(
         max_epochs=train_cfg["epochs"],
         accelerator="auto",
         devices="auto",
@@ -198,7 +199,7 @@ def main():
     print(f"Report will be saved to: {report_path}")
     print(f"Starting training for {train_cfg['epochs']} epochs...")
 
-    manager(ckpt_path=args.resume)
+    trainer.fit(module, datamodule=data, ckpt_path=args.resume)
 
 
 if __name__ == "__main__":
