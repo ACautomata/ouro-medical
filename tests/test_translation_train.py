@@ -1,7 +1,6 @@
 """
-System test: verify OuroMRI translation training pipeline on a single sample.
+System tests: verify OuroMRI translation training + inference pipeline on a single sample.
 
-Runs forward → loss → backward → optimizer step with a tiny model on CPU.
 No frameworks — raw PyTorch only.
 """
 
@@ -99,6 +98,24 @@ def test_loss_decreases_over_multiple_steps():
     )
 
 
+def _train_to_convergence(model, source, target, lr=1e-3, max_steps=2000, threshold=1e-3):
+    """Helper: train model on a single (source, target) pair until convergence."""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    initial_loss = None
+    for step in range(max_steps):
+        t = torch.rand(1)
+        result = model(source, target, t)
+        loss = result["loss"]
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        if step == 0:
+            initial_loss = loss.item()
+        if loss.item() < threshold:
+            return step, initial_loss, loss.item()
+    return max_steps - 1, initial_loss, loss.item()
+
+
 def test_single_sample_convergence():
     """Slow test: train on one sample until loss converges to near-zero."""
     config = _tiny_config()
@@ -108,30 +125,33 @@ def test_single_sample_convergence():
     torch.manual_seed(0)
     source = torch.randn(1, 1, 32, 32)
     target = torch.randn(1, 1, 32, 32)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    convergence_threshold = 1e-3
-    max_steps = 2000
+    step, initial, final = _train_to_convergence(model, source, target)
+    print(f"  Initial loss: {initial:.6f}")
+    print(f"  Converged at step {step}, loss: {final:.6f}")
+    assert final < 1e-3, f"Did not converge: {final:.6f}"
 
-    for step in range(max_steps):
-        t = torch.rand(1)
-        result = model(source, target, t)
-        loss = result["loss"]
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
 
-        if step == 0:
-            initial_loss = loss.item()
-            print(f"  Initial loss: {initial_loss:.6f}")
+def test_translate_matches_training():
+    """Slow test: after training on one sample, translate(source) should ≈ target."""
+    config = _tiny_config()
+    model = OuroForImageTranslation(config)
+    model.train()
 
-        if loss.item() < convergence_threshold:
-            print(f"  Converged at step {step}, loss: {loss.item():.6f}")
-            return
+    torch.manual_seed(0)
+    source = torch.randn(1, 1, 32, 32)
+    target = torch.randn(1, 1, 32, 32)
 
-    raise AssertionError(
-        f"Did not converge after {max_steps} steps (initial: {initial_loss:.6f}, last: {loss.item():.6f})"
-    )
+    step, initial, final = _train_to_convergence(model, source, target)
+    print(f"  Training: initial={initial:.6f}, converged at step {step}, loss={final:.6f}")
+
+    model.eval()
+    torch.manual_seed(99)
+    generated = model.translate(source, num_steps=50)
+
+    mae = (generated - target).abs().mean().item()
+    print(f"  Inference MAE vs target: {mae:.6f}")
+    assert mae < 0.1, f"translate output too far from target: MAE={mae:.4f}"
 
 
 if __name__ == "__main__":
@@ -149,6 +169,10 @@ if __name__ == "__main__":
     if slow:
         print("Running test_single_sample_convergence (slow) ...")
         test_single_sample_convergence()
+        print("PASSED\n")
+
+        print("Running test_translate_matches_training (slow) ...")
+        test_translate_matches_training()
         print("PASSED\n")
 
     print("All tests passed.")

@@ -228,14 +228,15 @@ class OuroForImageTranslation(PreTrainedModel):
         source_patches = patchify(source_image, self.patch_size)
         N_patches = source_patches.shape[1]
         source_flat = source_patches.view(B * N_patches, C, self.patch_size, self.patch_size)
-        source_embeds = self.ve(source_flat, grid_hw=grid_hw)  # [B*N, ve_hidden]
-        source_embeds = self.ve_proj(source_embeds)  # [B*N, hidden_size]
+        source_embeds = self.ve(source_flat, grid_hw=grid_hw)
+        source_embeds = self.ve_proj(source_embeds)
         source_embeds = source_embeds.view(B, N_patches, self.hidden_size)
 
-        # Initialize target from pure noise (t=0)
+        # Initialize from noise (x_1 in the flow: x_t = (1-t)*x_0 + t*ε)
         z = torch.randn(B, N_patches, C, self.patch_size, self.patch_size, device=device)
 
-        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        # Integrate from t=1 (noise) to t=0 (clean)
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
         for step_i in range(num_steps):
             t = timesteps[step_i]
@@ -244,8 +245,8 @@ class OuroForImageTranslation(PreTrainedModel):
 
             # Encode current noisy target
             z_flat = z.view(B * N_patches, C, self.patch_size, self.patch_size)
-            target_embeds = self.ve(z_flat, grid_hw=grid_hw)  # [B*N, ve_hidden]
-            target_embeds = self.ve_proj(target_embeds)  # [B*N, hidden_size]
+            target_embeds = self.ve(z_flat, grid_hw=grid_hw)
+            target_embeds = self.ve_proj(target_embeds)
             target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
 
             # Add timestep embedding
@@ -261,16 +262,16 @@ class OuroForImageTranslation(PreTrainedModel):
                 use_cache=False,
             )
 
-            # Predict x_0 and compute velocity
+            # Predict x_0
             target_hidden = outputs.last_hidden_state[:, N_patches:, :]
             x_0_pred = self.diffusion_head(target_hidden, t_batch)
             x_0_pred = x_0_pred.view(B, N_patches, C, self.patch_size, self.patch_size)
 
-            # Velocity: v = (x_0_pred - z) / (1 - t)
-            denom = (1 - t).clamp_min(self.t_eps)
-            v_pred = (x_0_pred - z) / denom
+            # Velocity: v = dx/dt = (x_t - x_0) / t
+            denom = t.clamp_min(self.t_eps)
+            v_pred = (z - x_0_pred) / denom
 
-            # Euler step: z = z + (t_next - t) * v
+            # Euler step (dt < 0 since t_next < t)
             z = z + (t_next - t) * v_pred
 
             if verbose and (step_i % 10 == 0 or step_i == num_steps - 1):
