@@ -23,10 +23,20 @@ Ouro 的核心创新是 **Looped Language Model (LoopLM)**：将同一组 Transf
 ## Setup
 
 ```bash
+conda activate ouro-medical
 pip install -e ".[dev]"
 ```
 
 注意：需要 `transformers>=4.55.0,<4.56.0`。
+
+## Conda Environment
+
+项目使用 conda 环境 `ouro-medical`（Python 3.11, PyTorch 2.12, spt 0.1.6）。
+
+运行测试：
+```bash
+conda run -n ouro-medical pytest tests/
+```
 
 ## Vendored Code Copyright
 
