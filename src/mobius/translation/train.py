@@ -15,7 +15,12 @@ from .dataset import BraTS2023Dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OuroMRI image translation model")
-    parser.add_argument("--data_root", type=str, required=True, help="BraTS2023 dataset path")
+    parser.add_argument("--data_root", type=str, required=True, help="BraTS2023 dataset root path")
+    parser.add_argument(
+        "--subtypes", type=str, nargs="+",
+        default=["GLI", "MEN", "MET", "PED", "SSA"],
+        help="BraTS subtypes to include",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Checkpoint output path")
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
@@ -208,7 +213,9 @@ def main():
     )
 
     # Calculate training steps
-    train_dataset = BraTS2023Dataset(args.data_root, split="train")
+    train_dataset = BraTS2023Dataset(
+        args.data_root, subtypes=args.subtypes, split="train",
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
