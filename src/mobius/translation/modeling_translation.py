@@ -70,6 +70,11 @@ class OuroForImageTranslation(PreTrainedModel):
 
     def __init__(self, config: OuroMRIConfig):
         super().__init__(config)
+        if config.downsample_ratio != 1.0:
+            raise ValueError(
+                "OuroForImageTranslation currently requires downsample_ratio=1.0 because "
+                "the diffusion head predicts one output patch per input patch."
+            )
         self.config = config
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size

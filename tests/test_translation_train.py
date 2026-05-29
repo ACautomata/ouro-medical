@@ -173,6 +173,18 @@ def test_batch_forward():
     optimizer.step()
 
 
+def test_downsample_ratio_not_supported():
+    """Model should fail fast for configs that break patch-token alignment."""
+    config = _tiny_config()
+    config.downsample_ratio = 0.5
+    try:
+        OuroForImageTranslation(config)
+    except ValueError as exc:
+        assert "downsample_ratio=1.0" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when downsample_ratio != 1.0")
+
+
 if __name__ == "__main__":
     import sys
     slow = "--slow" in sys.argv
