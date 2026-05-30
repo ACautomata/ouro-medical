@@ -20,6 +20,7 @@ model:
   downsample_ratio: 1.0
   total_ut_steps: 4
   fm_steps: 50
+  fm_strategy: standard    # "standard" (multi-step Euler) or "meanflow" (1-step via MeanFlow Identity)
 
 training:
   epochs: 100

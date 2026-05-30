@@ -7,7 +7,8 @@ from transformers.modeling_utils import PreTrainedModel
 from .config import OuroMRIConfig
 from .ve import VisionEmbeddings
 from .modeling_backbone import OuroImageBackbone
-from .modeling_diffusion import DiffusionHead
+from .modeling_diffusion import DiffusionHead, TimestepEmbedder
+from .modeling_meanflow import MeanFlowHead
 
 
 def patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -81,6 +82,7 @@ class OuroForImageTranslation(PreTrainedModel):
         self.t_eps = config.t_eps
         self.num_inference_steps = config.fm_steps
         self.total_ut_steps = config.total_ut_steps
+        self.fm_strategy = config.fm_strategy
 
         # Compute patch dimension: C * patch_size * patch_size
         patch_dim = config.num_channels * config.patch_size * config.patch_size
@@ -101,14 +103,25 @@ class OuroForImageTranslation(PreTrainedModel):
         # Ouro UT loop backbone
         self.backbone = OuroImageBackbone(config)
 
-        # Flow Matching diffusion head
-        self.diffusion_head = DiffusionHead(
-            input_dim=config.hidden_size,
-            out_dim=patch_dim,
-            dim=config.hidden_size,
-            num_res_blocks=4,
-            mlp_ratio=1.0,
-        )
+        if config.fm_strategy == "meanflow":
+            # MeanFlow: separate backbone timestep embedder + MeanFlowHead
+            self.backbone_timestep_embed = TimestepEmbedder(config.hidden_size)
+            self.diffusion_head = MeanFlowHead(
+                input_dim=config.hidden_size,
+                out_dim=patch_dim,
+                dim=config.hidden_size,
+                num_res_blocks=4,
+                mlp_ratio=1.0,
+            )
+        else:
+            # Standard flow matching: DiffusionHead (unchanged)
+            self.diffusion_head = DiffusionHead(
+                input_dim=config.hidden_size,
+                out_dim=patch_dim,
+                dim=config.hidden_size,
+                num_res_blocks=4,
+                mlp_ratio=1.0,
+            )
 
         self.post_init()
 
@@ -120,6 +133,32 @@ class OuroForImageTranslation(PreTrainedModel):
         grid = torch.tensor([[h_patches, w_patches]], device=self.device, dtype=torch.long)
         return grid.expand(batch_size, -1)
 
+    def _embed_timestep_for_backbone(self, t: torch.Tensor) -> torch.Tensor:
+        """Embed timestep t for backbone conditioning.
+
+        Standard strategy uses the DiffusionHead's embedder (shared with the head).
+        MeanFlow strategy uses a dedicated backbone embedder (head has its own for (r,t)).
+        """
+        if self.fm_strategy == "meanflow":
+            return self.backbone_timestep_embed(t)
+        return self.diffusion_head.timestep_embed(t)
+
+    def _compute_exit_pdf(
+        self, gate_list: list[torch.Tensor], seq_len: int, B: int, device: torch.device,
+    ) -> list[torch.Tensor]:
+        """Compute exit probability distribution from gate outputs."""
+        pdf_list = []
+        remaining_prob = torch.ones(B, seq_len, device=device)
+        for idx, gate_tensor in enumerate(gate_list):
+            lambda_i = torch.sigmoid(gate_tensor.squeeze(-1))  # [B, seq_len]
+            if idx < len(gate_list) - 1:
+                p_i = lambda_i * remaining_prob
+                remaining_prob = remaining_prob * (1.0 - lambda_i)
+            else:
+                p_i = remaining_prob
+            pdf_list.append(p_i)
+        return pdf_list
+
     def forward(
         self,
         source_image: torch.Tensor,
@@ -127,7 +166,7 @@ class OuroForImageTranslation(PreTrainedModel):
         t: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
-        Training forward pass with flow matching.
+        Training forward pass.
 
         Args:
             source_image: [B, C, H, W] — source contrast image
@@ -135,7 +174,7 @@ class OuroForImageTranslation(PreTrainedModel):
             t: [B] — timesteps in [0, 1]. Sampled uniformly if None.
 
         Returns:
-            dict with 'loss' (MSE between predicted and ground-truth x_0)
+            dict with 'loss' and prediction tensors
         """
         B, C, H, W = source_image.shape
         device = source_image.device
@@ -144,68 +183,105 @@ class OuroForImageTranslation(PreTrainedModel):
         if t is None:
             t = torch.rand(B, device=device)
 
-        # Encode source image
-        source_patches = patchify(source_image, self.patch_size)  # [B, N, C, P, P]
+        # --- Shared: encode source image ---
+        source_patches = patchify(source_image, self.patch_size)
         N_patches = source_patches.shape[1]
         source_patches_flat = source_patches.view(B * N_patches, C, self.patch_size, self.patch_size)
-        source_embeds = self.ve(source_patches_flat, grid_hw=grid_hw)  # [B*N, ve_hidden]
-        source_embeds = self.ve_proj(source_embeds)  # [B*N, hidden_size]
+        source_embeds = self.ve(source_patches_flat, grid_hw=grid_hw)
+        source_embeds = self.ve_proj(source_embeds)
         source_embeds = source_embeds.view(B, N_patches, self.hidden_size)
 
-        # Patchify target and add noise: x_t = (1-t)·x_0 + t·ε
-        target_patches = patchify(target_image, self.patch_size)  # [B, N, C, P, P]
+        # --- Shared: create noisy target ---
+        target_patches = patchify(target_image, self.patch_size)
         noise = torch.randn_like(target_patches)
         t_reshaped = t[:, None, None, None, None]
         noisy_patches = (1 - t_reshaped) * target_patches + t_reshaped * noise
 
         # Encode noisy target
         noisy_flat = noisy_patches.view(B * N_patches, C, self.patch_size, self.patch_size)
-        target_embeds = self.ve(noisy_flat, grid_hw=grid_hw)  # [B*N, ve_hidden]
-        target_embeds = self.ve_proj(target_embeds)  # [B*N, hidden_size]
+        target_embeds = self.ve(noisy_flat, grid_hw=grid_hw)
+        target_embeds = self.ve_proj(target_embeds)
         target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
 
-        # Add timestep embedding to target embeddings
-        t_emb = self.diffusion_head.timestep_embed(t)  # [B, hidden_size]
+        # Add timestep embedding for backbone conditioning
+        t_emb = self._embed_timestep_for_backbone(t)
         t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
         target_embeds = target_embeds + t_emb
 
-        # Concatenate and run backbone
-        combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)  # [B, 2N, C]
+        # --- Shared: run backbone ---
+        combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)
         outputs, hidden_states_list, gate_list = self.backbone(
             inputs_embeds=combined_embeds,
-            attention_mask=None,  # bidirectional
+            attention_mask=None,
             use_cache=False,
         )
 
-        # Compute exit probability distribution from gates (same as OuroForCausalLM)
-        pdf_list = []
-        remaining_prob = torch.ones(B, combined_embeds.shape[1], device=device)
-        for idx, gate_tensor in enumerate(gate_list):
-            lambda_i = torch.sigmoid(gate_tensor.squeeze(-1))  # [B, 2N]
-            if idx < len(gate_list) - 1:
-                p_i = lambda_i * remaining_prob
-                remaining_prob = remaining_prob * (1.0 - lambda_i)
-            else:
-                p_i = remaining_prob
-            pdf_list.append(p_i)
+        pdf_list = self._compute_exit_pdf(gate_list, combined_embeds.shape[1], B, device)
 
-        # Weighted x_0 prediction across UT steps
-        x_0_expected = torch.zeros(
-            B, N_patches, C, self.patch_size, self.patch_size, device=device
-        )
+        # --- Strategy-specific loss ---
+        if self.fm_strategy == "meanflow":
+            return self._forward_meanflow(
+                hidden_states_list, pdf_list, N_patches, B, C, t, target_patches, noise, device,
+            )
+        else:
+            return self._forward_standard(
+                hidden_states_list, pdf_list, N_patches, B, C, t, target_patches,
+            )
+
+    def _forward_standard(
+        self, hidden_states_list, pdf_list, N_patches, B, C, t, target_patches,
+    ) -> dict[str, torch.Tensor]:
+        """Standard flow matching: weighted x_0 prediction, MSE loss."""
+        device = target_patches.device
+        P = self.patch_size
+
+        x_0_expected = torch.zeros(B, N_patches, C, P, P, device=device)
         for step_idx, hidden_states in enumerate(hidden_states_list):
-            target_hidden = hidden_states[:, N_patches:, :]  # [B, N, C]
+            target_hidden = hidden_states[:, N_patches:, :]
             x_0_step = self.diffusion_head(target_hidden, t)
-            x_0_step = x_0_step.view(B, N_patches, C, self.patch_size, self.patch_size)
-            # Use target-position exit probabilities as weights
-            weight = pdf_list[step_idx][:, N_patches:]  # [B, N]
-            weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, N, 1, 1, 1]
+            x_0_step = x_0_step.view(B, N_patches, C, P, P)
+            weight = pdf_list[step_idx][:, N_patches:]
+            weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
             x_0_expected = x_0_expected + weight * x_0_step
 
-        # Loss: MSE between weighted prediction and ground truth target patches
         loss = nn.functional.mse_loss(x_0_expected, target_patches)
-
         return {"loss": loss, "x_0_pred": x_0_expected}
+
+    def _forward_meanflow(
+        self, hidden_states_list, pdf_list, N_patches, B, C, t, target_patches, noise, device,
+    ) -> dict[str, torch.Tensor]:
+        """MeanFlow: combined hidden state → average velocity → v-loss via JVP."""
+        P = self.patch_size
+
+        # Weighted combination of hidden states across UT steps
+        combined_hidden = torch.zeros(B, N_patches, self.hidden_size, device=device)
+        for step_idx, hidden_states in enumerate(hidden_states_list):
+            target_hidden = hidden_states[:, N_patches:, :]
+            weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
+            combined_hidden = combined_hidden + weight * target_hidden
+
+        # Sample interval start r
+        # With 50% probability use r=0 (enables one-step inference),
+        # otherwise sample r uniformly in [0, t)
+        r = torch.zeros(B, device=device)
+        random_mask = torch.rand(B, device=device) < 0.5
+        r[random_mask] = torch.rand(random_mask.sum(), device=device) * t[random_mask]
+
+        # Ground-truth velocity: v = ε - x_0 (constant for linear interpolation)
+        v_target = (noise - target_patches).view(B, N_patches, -1)  # [B, N, C*P*P]
+
+        # MeanFlow v-loss with JVP
+        loss, u_pred = self.diffusion_head.compute_vloss(combined_hidden, t, r, v_target)
+
+        # Also compute x_0 from u for logging: x_0 = x_t - (t-r) * u
+        dt = (t - r)
+        u_patches = u_pred.view(B, N_patches, C, P, P)
+        t_reshaped = t[:, None, None, None, None]
+        noisy_patches = (1 - t_reshaped) * target_patches + t_reshaped * noise
+        dt_reshaped = dt[:, None, None, None, None]
+        x_0_pred = noisy_patches - dt_reshaped * u_patches
+
+        return {"loss": loss, "x_0_pred": x_0_pred}
 
     @torch.no_grad()
     def translate(
@@ -215,16 +291,27 @@ class OuroForImageTranslation(PreTrainedModel):
         verbose: bool = False,
     ) -> torch.Tensor:
         """
-        Inference: translate source image to target contrast via iterative denoising.
+        Inference: translate source image to target contrast.
+
+        For "standard": multi-step Euler ODE denoising.
+        For "meanflow": MeanFlow sampling (1-step or multi-step).
 
         Args:
             source_image: [B, C, H, W] — source contrast image
-            num_steps: number of Euler integration steps (default: config.num_inference_steps)
+            num_steps: number of sampling steps (default: config.fm_steps)
             verbose: if True, print progress
 
         Returns:
-            generated_image: [B, C, H, W] — translated target contrast image
+            generated_image: [B, C, H, W]
         """
+        if self.fm_strategy == "meanflow":
+            return self._translate_meanflow(source_image, num_steps, verbose)
+        return self._translate_standard(source_image, num_steps, verbose)
+
+    def _translate_standard(
+        self, source_image: torch.Tensor, num_steps: Optional[int], verbose: bool,
+    ) -> torch.Tensor:
+        """Multi-step Euler ODE denoising (standard flow matching)."""
         B, C, H, W = source_image.shape
         device = source_image.device
         grid_hw = self._get_grid_hw((H, W), batch_size=B)
@@ -238,10 +325,7 @@ class OuroForImageTranslation(PreTrainedModel):
         source_embeds = self.ve_proj(source_embeds)
         source_embeds = source_embeds.view(B, N_patches, self.hidden_size)
 
-        # Initialize from noise (x_1 in the flow: x_t = (1-t)*x_0 + t*ε)
         z = torch.randn(B, N_patches, C, self.patch_size, self.patch_size, device=device)
-
-        # Integrate from t=1 (noise) to t=0 (clean)
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
         for step_i in range(num_steps):
@@ -255,54 +339,102 @@ class OuroForImageTranslation(PreTrainedModel):
             target_embeds = self.ve_proj(target_embeds)
             target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
 
-            # Add timestep embedding
             t_emb = self.diffusion_head.timestep_embed(t_batch)
+            t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
+            target_embeds = target_embeds + t_emb
+
+            combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)
+            outputs, hidden_states_list, gate_list = self.backbone(
+                inputs_embeds=combined_embeds, attention_mask=None, use_cache=False,
+            )
+            pdf_list = self._compute_exit_pdf(gate_list, combined_embeds.shape[1], B, device)
+
+            x_0_pred = torch.zeros(B, N_patches, C, self.patch_size, self.patch_size, device=device)
+            for step_idx, hidden_states in enumerate(hidden_states_list):
+                target_hidden = hidden_states[:, N_patches:, :]
+                x_0_step = self.diffusion_head(target_hidden, t_batch)
+                x_0_step = x_0_step.view(B, N_patches, C, self.patch_size, self.patch_size)
+                weight = pdf_list[step_idx][:, N_patches:]
+                weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                x_0_pred = x_0_pred + weight * x_0_step
+
+            denom = t.clamp_min(self.t_eps)
+            v_pred = (z - x_0_pred) / denom
+            z = z + (t_next - t) * v_pred
+
+            if verbose and (step_i % 10 == 0 or step_i == num_steps - 1):
+                print(f"  Step {step_i+1}/{num_steps}, t={t:.4f}")
+
+        return unpatchify(z, self.patch_size, H, W)
+
+    def _translate_meanflow(
+        self, source_image: torch.Tensor, num_steps: Optional[int], verbose: bool,
+    ) -> torch.Tensor:
+        """MeanFlow sampling: x_r = x_t - (t-r) * u_θ(x_t, r, t).
+
+        For num_steps=1: one-step generation (x_0 = ε - u_θ(ε, 0, 1)).
+        For num_steps=N: split [0,1] into N intervals, apply u_θ per interval.
+        """
+        B, C, H, W = source_image.shape
+        device = source_image.device
+        grid_hw = self._get_grid_hw((H, W), batch_size=B)
+        num_steps = num_steps if num_steps is not None else 1  # MeanFlow default: 1-step
+        P = self.patch_size
+
+        # Encode source image once
+        source_patches = patchify(source_image, P)
+        N_patches = source_patches.shape[1]
+        source_flat = source_patches.view(B * N_patches, C, P, P)
+        source_embeds = self.ve(source_flat, grid_hw=grid_hw)
+        source_embeds = self.ve_proj(source_embeds)
+        source_embeds = source_embeds.view(B, N_patches, self.hidden_size)
+
+        # Start from noise
+        z = torch.randn(B, N_patches, C, P, P, device=device)
+
+        # Split [0, 1] into num_steps intervals
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            r_i = torch.full((B,), i * dt, device=device)
+            t_i = torch.full((B,), (i + 1) * dt, device=device)
+
+            # Encode current z
+            z_flat = z.view(B * N_patches, C, P, P)
+            target_embeds = self.ve(z_flat, grid_hw=grid_hw)
+            target_embeds = self.ve_proj(target_embeds)
+            target_embeds = target_embeds.view(B, N_patches, self.hidden_size)
+
+            # Backbone timestep conditioning uses t (endpoint)
+            t_emb = self.backbone_timestep_embed(t_i)
             t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
             target_embeds = target_embeds + t_emb
 
             # Run backbone
             combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)
             outputs, hidden_states_list, gate_list = self.backbone(
-                inputs_embeds=combined_embeds,
-                attention_mask=None,
-                use_cache=False,
+                inputs_embeds=combined_embeds, attention_mask=None, use_cache=False,
             )
+            pdf_list = self._compute_exit_pdf(gate_list, combined_embeds.shape[1], B, device)
 
-            # Compute exit probability distribution from gates (same as training forward)
-            pdf_list = []
-            remaining_prob = torch.ones(B, combined_embeds.shape[1], device=device)
-            for idx, gate_tensor in enumerate(gate_list):
-                lambda_i = torch.sigmoid(gate_tensor.squeeze(-1))  # [B, 2N]
-                if idx < len(gate_list) - 1:
-                    p_i = lambda_i * remaining_prob
-                    remaining_prob = remaining_prob * (1.0 - lambda_i)
-                else:
-                    p_i = remaining_prob
-                pdf_list.append(p_i)
-
-            # Weighted x_0 prediction across UT steps (matches training objective)
-            x_0_pred = torch.zeros(B, N_patches, C, self.patch_size, self.patch_size, device=device)
+            # Combine hidden states across UT steps
+            combined_hidden = torch.zeros(B, N_patches, self.hidden_size, device=device)
             for step_idx, hidden_states in enumerate(hidden_states_list):
-                target_hidden = hidden_states[:, N_patches:, :]  # [B, N, C]
-                x_0_step = self.diffusion_head(target_hidden, t_batch)
-                x_0_step = x_0_step.view(B, N_patches, C, self.patch_size, self.patch_size)
-                weight = pdf_list[step_idx][:, N_patches:]  # [B, N]
-                weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, N, 1, 1, 1]
-                x_0_pred = x_0_pred + weight * x_0_step
+                target_hidden = hidden_states[:, N_patches:, :]
+                weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
+                combined_hidden = combined_hidden + weight * target_hidden
 
-            # Velocity: v = dx/dt = (x_t - x_0) / t
-            denom = t.clamp_min(self.t_eps)
-            v_pred = (z - x_0_pred) / denom
+            # Predict average velocity u for interval [r_i, t_i]
+            u = self.diffusion_head(combined_hidden, t_i, r_i)  # [B, N, C*P*P]
+            u = u.view(B, N_patches, C, P, P)
 
-            # Euler step (dt < 0 since t_next < t)
-            z = z + (t_next - t) * v_pred
+            # Update: x_r = x_t - (t - r) * u
+            z = z - dt * u
 
-            if verbose and (step_i % 10 == 0 or step_i == num_steps - 1):
-                print(f"  Step {step_i+1}/{num_steps}, t={t:.4f}")
+            if verbose:
+                print(f"  Step {i+1}/{num_steps}, r={r_i[0]:.4f}, t={t_i[0]:.4f}")
 
-        # Unpatchify to get final image
-        generated_image = unpatchify(z, self.patch_size, H, W)
-        return generated_image
+        return unpatchify(z, P, H, W)
 
 
 __all__ = ["OuroForImageTranslation", "patchify", "unpatchify"]
