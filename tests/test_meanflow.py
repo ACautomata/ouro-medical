@@ -59,7 +59,7 @@ class TestMeanFlowHead:
         assert out.shape == (B, out_dim)
 
     def test_vloss_backward(self):
-        """MeanFlow v-loss produces finite gradients."""
+        """MeanFlow v-loss produces finite gradients via full-pipeline JVP."""
         B, N, dim, out_dim = 1, 4, 64, 16
         head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
 
@@ -68,7 +68,10 @@ class TestMeanFlowHead:
         r = torch.zeros(B)
         v_target = torch.randn(B, N, out_dim)
 
-        loss, u = head.compute_vloss(backbone_hidden, t, r, v_target)
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, u = head.compute_vloss(pipeline_fn, t, r, v_target)
 
         assert loss.dim() == 0
         assert torch.isfinite(loss)
@@ -82,7 +85,7 @@ class TestMeanFlowHead:
         assert not params_without_grad, f"Missing grads: {params_without_grad[:5]}"
 
     def test_vloss_gradient_flows_to_backbone(self):
-        """Gradient flows through to backbone hidden states."""
+        """Gradient flows through to backbone hidden states via pipeline JVP."""
         B, N, dim, out_dim = 1, 4, 64, 16
         head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
 
@@ -91,7 +94,10 @@ class TestMeanFlowHead:
         r = torch.zeros(B)
         v_target = torch.randn(B, N, out_dim)
 
-        loss, _ = head.compute_vloss(backbone_hidden, t, r, v_target)
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, _ = head.compute_vloss(pipeline_fn, t, r, v_target)
         loss.backward()
 
         assert backbone_hidden.grad is not None, "No gradient on backbone_hidden"
@@ -107,9 +113,65 @@ class TestMeanFlowHead:
         r = torch.tensor([0.3])
         v_target = torch.randn(B, N, out_dim)
 
-        loss, _ = head.compute_vloss(backbone_hidden, t, r, v_target)
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, _ = head.compute_vloss(pipeline_fn, t, r, v_target)
         assert torch.isfinite(loss)
         loss.backward()
+
+    def test_vloss_jvp_numerical_correctness(self):
+        """JVP du/dt matches finite difference approximation."""
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+        head.eval()
+
+        backbone_hidden = torch.randn(B, N, dim)
+        t = torch.tensor([0.5])
+        r = torch.tensor([0.2])
+
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        # JVP
+        with torch.no_grad():
+            u_jvp, du_dt_jvp = torch.func.jvp(
+                pipeline_fn, (t.float(),), (torch.ones_like(t).float(),)
+            )
+
+        # Finite difference: du/dt ≈ (u(t+eps) - u(t-eps)) / (2*eps)
+        eps = 1e-4
+        with torch.no_grad():
+            u_plus = pipeline_fn((t + eps).float())
+            u_minus = pipeline_fn((t - eps).float())
+            du_dt_fd = (u_plus - u_minus) / (2 * eps)
+
+        # The JVP computes the total derivative. Since backbone_hidden
+        # is a constant (no t-dependence), JVP should match the finite diff.
+        max_diff = (du_dt_jvp - du_dt_fd).abs().max().item()
+        assert max_diff < 1e-2, (
+            f"JVP du/dt does not match finite difference: max_diff={max_diff:.6f}"
+        )
+
+    def test_vloss_boundary_cases(self):
+        """v-loss handles boundary t values without NaN/Inf."""
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+
+        backbone_hidden = torch.randn(B, N, dim)
+
+        for t_val in [0.01, 0.5, 0.99]:
+            for r_val in [0.0, t_val * 0.5]:
+                t = torch.tensor([t_val])
+                r = torch.tensor([r_val])
+                v_target = torch.randn(B, N, out_dim)
+
+                def pipeline_fn(tv, _r=r):
+                    return head(backbone_hidden, tv, _r)
+
+                loss, u = head.compute_vloss(pipeline_fn, t, r, v_target)
+                assert torch.isfinite(loss), f"Non-finite loss at t={t_val}, r={r_val}"
+                assert torch.isfinite(u).all(), f"Non-finite u at t={t_val}, r={r_val}"
 
 
 # ---------------------------------------------------------------------------

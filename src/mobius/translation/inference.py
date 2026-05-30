@@ -14,6 +14,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from .modeling_translation import OuroForImageTranslation
+from .config import OuroMRIConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ def save_image(tensor: torch.Tensor, output_path: str, normalize: bool = True):
             Image.fromarray(img_np).save(str(path))
 
 
-def unpatchify(x: torch.Tensor, H: int, W: int, patch_size: int = 16) -> torch.Tensor:
+def unpatchify_local(x: torch.Tensor, H: int, W: int, patch_size: int = 16) -> torch.Tensor:
     """Convert patch tokens back to spatial format."""
     B, N, D = x.shape
     num_patches_h = H // patch_size
@@ -198,6 +199,54 @@ def unpatchify(x: torch.Tensor, H: int, W: int, patch_size: int = 16) -> torch.T
     x = x.permute(0, 5, 1, 3, 2, 4)  # [B, D, num_patches_h, patch_size, num_patches_w, patch_size]
     x = x.reshape(B, D, H, W)
     return x
+
+
+def _load_model(checkpoint_path: str, device: str = "cuda") -> OuroForImageTranslation:
+    """Load model from a Lightning .ckpt or HuggingFace directory.
+
+    Lightning checkpoints store state_dict with a ``model.`` prefix
+    (from spt.Module wrapping).  HuggingFace directories contain
+    ``config.json`` + ``model.safetensors``.  This helper handles both.
+    """
+    from pathlib import Path
+    import json
+
+    ckpt = Path(checkpoint_path)
+
+    # --- HuggingFace directory ---
+    if ckpt.is_dir() and (ckpt / "config.json").exists():
+        return OuroForImageTranslation.from_pretrained(str(ckpt)).to(device)
+
+    # --- Lightning .ckpt file ---
+    try:
+        payload = torch.load(str(ckpt), map_location=device, weights_only=True)
+    except Exception:
+        logger.warning(
+            "weights_only=True failed for %s — falling back to weights_only=False. "
+            "Only load checkpoints from sources you trust.",
+            ckpt,
+        )
+        payload = torch.load(str(ckpt), map_location=device, weights_only=False)
+    state_dict = payload.get("state_dict", payload)
+
+    # Strip spt.Module ``model.`` prefix
+    clean_sd = {
+        k.replace("model.", "", 1) if k.startswith("model.") else k: v
+        for k, v in state_dict.items()
+    }
+
+    # Look for a config.json alongside the checkpoint
+    config_path = ckpt.parent / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            config = OuroMRIConfig(**json.load(f))
+    else:
+        logger.warning("No config.json found next to checkpoint; using default config.")
+        config = OuroMRIConfig()
+
+    model = OuroForImageTranslation(config)
+    model.load_state_dict(clean_sd, strict=False)
+    return model.to(device)
 
 
 def translate_image(
@@ -399,7 +448,7 @@ def main():
 
     # Load model from checkpoint
     logger.info(f"Loading model from: {args.checkpoint_path}")
-    model = OuroForImageTranslation.from_pretrained(args.checkpoint_path)
+    model = _load_model(args.checkpoint_path, args.device)
     model.to(device)
     model.eval()
 

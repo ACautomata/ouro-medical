@@ -135,82 +135,38 @@ class MeanFlowHead(nn.Module):
 
     def compute_vloss(
         self,
-        backbone_hidden: torch.Tensor,
+        pipeline_fn,
         t: torch.Tensor,
         r: torch.Tensor,
         v_target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute MeanFlow v-loss using the MeanFlow Identity.
+        """Compute MeanFlow v-loss via JVP through the full model pipeline.
 
-        V_θ = u_θ + (t - r) · du_θ/dt   (via forward-mode JVP)
-        Loss = ||V_θ - v_target||²
-
-        The primal u is computed with gradient flow to the backbone.
-        The JVP du/dt uses detached backbone hidden states (practical
-        approximation — full JVP through the backbone is prohibitively
-        expensive for the UT loop architecture).
+        The total derivative d/dt u_θ is computed by JVP through the entire
+        pipeline (VE → backbone → head), capturing all t-dependent paths:
+        z_t interpolation, timestep embeddings, and the explicit t input.
 
         Args:
-            backbone_hidden: [B, N, input_dim] backbone output.
+            pipeline_fn: function(t: [B]) -> u: [B, N, out_dim].
+                Encapsulates the full forward pass from timestep t to
+                average velocity prediction u.
             t: [B] endpoint timestep.
             r: [B] interval start timestep.
             v_target: [B, N, out_dim] ground-truth velocity (ε - x_0).
 
         Returns:
-            (loss, u) tuple — loss is differentiable, u is the primal prediction.
+            (loss, u) — loss is differentiable, u is the primal prediction.
         """
-        # Primal: compute u with gradient flow to backbone
-        u = self.forward(backbone_hidden, t, r)
-
-        # JVP: compute du/dt with detached backbone (efficiency)
-        du_dt = self._compute_du_dt(backbone_hidden.detach(), t, r)
+        # Disable autocast for JVP precision (bf16 tangents lose precision)
+        with torch.amp.autocast(device_type=t.device.type, enabled=False):
+            u, du_dt = jvp(pipeline_fn, (t.float(),), (torch.ones_like(t).float(),))
 
         # MeanFlow Identity: V_θ = u + (t - r) · du/dt
-        dt = (t - r)  # [B]
+        dt = (t - r)
         V_theta = u + dt.view(-1, 1, 1) * du_dt
 
         loss = F.mse_loss(V_theta, v_target)
         return loss, u
-
-    def _compute_du_dt(
-        self,
-        backbone_hidden: torch.Tensor,
-        t: torch.Tensor,
-        r: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute du_θ/dt via forward-mode JVP (per-sample loop).
-
-        Uses torch.func.jvp with detached backbone_hidden for efficiency.
-        The JVP captures how the head's prediction changes with t, which
-        is the key component of the MeanFlow Identity.
-
-        Args:
-            backbone_hidden: [B, N, input_dim] (already detached).
-            t: [B] endpoint timestep.
-            r: [B] interval start timestep.
-
-        Returns:
-            du/dt: [B, N, out_dim] same shape as head output.
-        """
-        B = t.shape[0]
-        du_dt_list = []
-
-        for i in range(B):
-            # Capture current loop values via default arguments
-            bh_i = backbone_hidden[i]      # [N, input_dim]
-            r_i = r[i]                      # scalar
-
-            def f(t_val, _bh=bh_i, _r=r_i):
-                return self.forward(
-                    _bh.unsqueeze(0),
-                    t_val.unsqueeze(0),
-                    _r.unsqueeze(0),
-                ).squeeze(0)
-
-            _, tangent = jvp(f, (t[i],), (torch.ones_like(t[i]),))
-            du_dt_list.append(tangent)
-
-        return torch.stack(du_dt_list)  # [B, N, out_dim]
 
 
 __all__ = ["MeanFlowHead"]

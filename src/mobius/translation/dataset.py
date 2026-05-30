@@ -12,6 +12,7 @@ from typing import Optional
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 # BraTS2023 file suffix → internal contrast name
@@ -100,10 +101,12 @@ class BraTS2023Dataset(Dataset):
         normalize: Optional[str] = "minmax",
         split: str = "train",
         lru_cache_size: int = 64,
+        image_size: Optional[int] = None,
     ):
         super().__init__()
         self.source_contrast = source_contrast.lower()
         self.target_contrast = target_contrast.lower()
+        self.image_size = image_size
         self.slice_range = slice_range
         self.normalize = normalize
 
@@ -173,6 +176,17 @@ class BraTS2023Dataset(Dataset):
 
         src_tensor = torch.from_numpy(src_slice).unsqueeze(0)
         tgt_tensor = torch.from_numpy(tgt_slice).unsqueeze(0)
+
+        # Resize if image_size is specified
+        if self.image_size is not None:
+            src_tensor = F.interpolate(
+                src_tensor.unsqueeze(0), size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+            tgt_tensor = F.interpolate(
+                tgt_tensor.unsqueeze(0), size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
 
         return {
             "source_image": src_tensor,
