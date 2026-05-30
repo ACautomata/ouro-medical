@@ -61,6 +61,11 @@ class OuroMRIConfig(PretrainedConfig):
             Number of flow matching inference steps.
         fm_cfg_guidance_scale (`float`, *optional*, defaults to 1.0):
             Classifier-free guidance scale for flow matching. 1.0 disables CFG.
+        fm_strategy (`str`, *optional*, defaults to `"standard"`):
+            Flow matching prediction strategy. One of:
+            - `"standard"`: x_0-prediction with MSE loss, multi-step Euler sampling.
+            - `"meanflow"`: MeanFlow average velocity with v-loss (iMF-style),
+              one-step sampling via the MeanFlow Identity.
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
             The epsilon used by RMS normalization layers.
         attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -102,6 +107,7 @@ class OuroMRIConfig(PretrainedConfig):
         early_exit_threshold: float = 1.0,
         fm_steps: int = 50,
         fm_cfg_guidance_scale: float = 1.0,
+        fm_strategy: str = "standard",
         t_eps: float = 1e-6,
         rms_norm_eps: float = 1e-6,
         attention_dropout: float = 0.0,
@@ -111,6 +117,11 @@ class OuroMRIConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        if fm_strategy not in ("standard", "meanflow"):
+            raise ValueError(
+                f"fm_strategy must be 'standard' or 'meanflow', got '{fm_strategy}'"
+            )
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -129,6 +140,7 @@ class OuroMRIConfig(PretrainedConfig):
         self.early_exit_threshold = early_exit_threshold
         self.fm_steps = fm_steps
         self.fm_cfg_guidance_scale = fm_cfg_guidance_scale
+        self.fm_strategy = fm_strategy
         self.rms_norm_eps = rms_norm_eps
         self.attention_dropout = attention_dropout
         self.mlp_dropout = mlp_dropout

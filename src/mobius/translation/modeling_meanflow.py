@@ -1,0 +1,216 @@
+"""MeanFlow head: one-step flow matching via average velocity prediction.
+
+Implements the MeanFlow Identity from "Mean Flows for One-step Generative Modeling"
+(Geng et al., NeurIPS 2025 Oral, arXiv:2505.13447) with the v-loss reparameterization
+from "Improved Mean Flows" (iMF, arXiv:2512.02012).
+
+Core idea:
+    The head predicts the average velocity u(z_t, r, t) for the time interval [r, t].
+    The MeanFlow Identity provides the training objective:
+        V_θ = u_θ + (t - r) · du_θ/dt    (via JVP)
+        Loss = ||V_θ - v_gt||²            where v_gt = ε - x_0
+
+    At inference, one-step generation:
+        x_0 = x_t - (t - r) · u_θ(x_t, r, t)
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.func import jvp
+
+from .modeling_diffusion import TimestepEmbedder, ResBlock, FinalLayer
+
+
+class MeanFlowHead(nn.Module):
+    """Flow matching head for MeanFlow average velocity prediction.
+
+    Takes backbone hidden states and dual timestep (r, t) as input,
+    predicts the average velocity u for the interval [r, t].
+
+    Args:
+        input_dim: Dimension of backbone hidden states.
+        out_dim: Output dimension (patch dimension: C * P * P).
+        dim: Internal channel dimension for residual blocks.
+        num_res_blocks: Number of adaLN residual blocks.
+        mlp_ratio: MLP expansion ratio in residual blocks.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        out_dim: int,
+        dim: int = 1024,
+        num_res_blocks: int = 4,
+        mlp_ratio: float = 1.0,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.out_dim = out_dim
+        self.dim = dim
+
+        # Input projection from backbone hidden size to head channels
+        self.input_proj = nn.Linear(input_dim, dim)
+
+        # Separate embedders for endpoint t and interval start r
+        self.timestep_embed = TimestepEmbedder(dim)
+        self.interval_embed = TimestepEmbedder(dim)
+
+        # Project concatenated (t_emb, r_emb) → conditioning vector
+        self.time_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(2 * dim, dim),
+        )
+
+        # AdaLN residual blocks
+        self.res_blocks = nn.ModuleList([
+            ResBlock(dim, mlp_ratio=mlp_ratio)
+            for _ in range(num_res_blocks)
+        ])
+
+        # Output projection
+        self.final_layer = FinalLayer(dim, out_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Xavier init + zero-init for adaLN modulation and output layers."""
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        for block in self.res_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict average velocity u for interval [r, t].
+
+        Args:
+            x: Backbone hidden states [B, N, input_dim] or [B, input_dim].
+            t: Endpoint timestep [B].
+            r: Interval start timestep [B].
+
+        Returns:
+            Average velocity prediction, same leading dims as out_dim.
+        """
+        is_3d = x.dim() == 3
+        if not is_3d:
+            x = x.unsqueeze(1)
+
+        batch_size, seq_len, _ = x.shape
+
+        # Project input
+        x = self.input_proj(x)
+
+        # Embed (r, t) jointly → conditioning
+        t_emb = self.timestep_embed(t)  # [B, dim]
+        r_emb = self.interval_embed(r)  # [B, dim]
+        cond = self.time_proj(torch.cat([t_emb, r_emb], dim=-1))  # [B, dim]
+        cond = cond.unsqueeze(1).expand(-1, seq_len, -1)  # [B, N, dim]
+
+        # Residual blocks with adaLN modulation
+        for block in self.res_blocks:
+            x = block(x, cond)
+
+        # Output projection
+        output = self.final_layer(x)
+
+        if not is_3d:
+            output = output.squeeze(1)
+
+        return output
+
+    def compute_vloss(
+        self,
+        backbone_hidden: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        v_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute MeanFlow v-loss using the MeanFlow Identity.
+
+        V_θ = u_θ + (t - r) · du_θ/dt   (via forward-mode JVP)
+        Loss = ||V_θ - v_target||²
+
+        The primal u is computed with gradient flow to the backbone.
+        The JVP du/dt uses detached backbone hidden states (practical
+        approximation — full JVP through the backbone is prohibitively
+        expensive for the UT loop architecture).
+
+        Args:
+            backbone_hidden: [B, N, input_dim] backbone output.
+            t: [B] endpoint timestep.
+            r: [B] interval start timestep.
+            v_target: [B, N, out_dim] ground-truth velocity (ε - x_0).
+
+        Returns:
+            (loss, u) tuple — loss is differentiable, u is the primal prediction.
+        """
+        # Primal: compute u with gradient flow to backbone
+        u = self.forward(backbone_hidden, t, r)
+
+        # JVP: compute du/dt with detached backbone (efficiency)
+        du_dt = self._compute_du_dt(backbone_hidden.detach(), t, r)
+
+        # MeanFlow Identity: V_θ = u + (t - r) · du/dt
+        dt = (t - r)  # [B]
+        V_theta = u + dt.view(-1, 1, 1) * du_dt
+
+        loss = F.mse_loss(V_theta, v_target)
+        return loss, u
+
+    def _compute_du_dt(
+        self,
+        backbone_hidden: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute du_θ/dt via forward-mode JVP (per-sample loop).
+
+        Uses torch.func.jvp with detached backbone_hidden for efficiency.
+        The JVP captures how the head's prediction changes with t, which
+        is the key component of the MeanFlow Identity.
+
+        Args:
+            backbone_hidden: [B, N, input_dim] (already detached).
+            t: [B] endpoint timestep.
+            r: [B] interval start timestep.
+
+        Returns:
+            du/dt: [B, N, out_dim] same shape as head output.
+        """
+        B = t.shape[0]
+        du_dt_list = []
+
+        for i in range(B):
+            # Capture current loop values via default arguments
+            bh_i = backbone_hidden[i]      # [N, input_dim]
+            r_i = r[i]                      # scalar
+
+            def f(t_val, _bh=bh_i, _r=r_i):
+                return self.forward(
+                    _bh.unsqueeze(0),
+                    t_val.unsqueeze(0),
+                    _r.unsqueeze(0),
+                ).squeeze(0)
+
+            _, tangent = jvp(f, (t[i],), (torch.ones_like(t[i]),))
+            du_dt_list.append(tangent)
+
+        return torch.stack(du_dt_list)  # [B, N, out_dim]
+
+
+__all__ = ["MeanFlowHead"]
