@@ -21,6 +21,9 @@ model:
   total_ut_steps: 4
   fm_steps: 50
   fm_strategy: standard    # "standard" (multi-step Euler) or "meanflow" (1-step via MeanFlow Identity)
+  fm_loss_type: v_loss     # MeanFlow 损失类型，仅 fm_strategy="meanflow" 时生效
+                           # "v_loss": iMF 风格，stop_gradient on du/dt，回归瞬时速度
+                           # "u_loss": 原始 MF 论文，梯度流过 du/dt（含二阶梯度）
 
 training:
   epochs: 100

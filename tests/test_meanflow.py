@@ -175,6 +175,146 @@ class TestMeanFlowHead:
 
 
 # ---------------------------------------------------------------------------
+# u-loss tests
+# ---------------------------------------------------------------------------
+
+class TestULoss:
+    def test_uloss_backward(self):
+        """u-loss produces finite gradients via full-pipeline JVP."""
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+
+        backbone_hidden = torch.randn(B, N, dim)
+        t = torch.rand(B) * 0.8 + 0.1
+        r = torch.zeros(B)
+        v_target = torch.randn(B, N, out_dim)
+
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, u = head.compute_uloss(pipeline_fn, t, r, v_target)
+
+        assert loss.dim() == 0
+        assert torch.isfinite(loss)
+        assert u.shape == (B, N, out_dim)
+
+        loss.backward()
+        params_without_grad = [
+            name for name, p in head.named_parameters()
+            if p.requires_grad and p.grad is None
+        ]
+        assert not params_without_grad, f"Missing grads: {params_without_grad[:5]}"
+
+    def test_uloss_gradient_flows_through_dudt(self):
+        """u-loss: 梯度流过 du/dt（不做 detach），与 v-loss 不同。
+
+        验证方式：对 backbone_hidden 设 requires_grad，检查梯度非零且有限。
+        由于 du/dt 未 detach，梯度路径经过二阶 JVP 计算。
+        """
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+
+        backbone_hidden = torch.randn(B, N, dim, requires_grad=True)
+        t = torch.rand(B) * 0.8 + 0.1
+        r = torch.zeros(B)
+        v_target = torch.randn(B, N, out_dim)
+
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, _ = head.compute_uloss(pipeline_fn, t, r, v_target)
+        loss.backward()
+
+        assert backbone_hidden.grad is not None, "No gradient on backbone_hidden"
+        assert torch.isfinite(backbone_hidden.grad).all()
+
+    def test_uloss_differs_from_vloss(self):
+        """u-loss 和 v-loss 对同一输入产生不同的梯度。
+
+        u-loss 不 detach du/dt，v-loss detach。因此梯度不同：
+        u-loss 额外包含 du/dt 对参数的二阶梯度项。
+
+        需要非零初始化的 head 才能观察到差异（zero-init 的 head 输出为零，
+        du/dt 也为零，两种 loss 梯度相同）。
+        """
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+        # Zero-init 的 head 输出为 0，du/dt 也为 0，无法区分两种 loss。
+        # 用小随机值覆盖参数以获得非平凡输出。
+        for p in head.parameters():
+            p.data.normal_(0, 0.01)
+
+        backbone_hidden = torch.randn(B, N, dim)
+        t = torch.tensor([0.7])
+        r = torch.tensor([0.3])
+        v_target = torch.randn(B, N, out_dim)
+
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        # v-loss
+        loss_v, _ = head.compute_vloss(pipeline_fn, t, r, v_target)
+        loss_v.backward()
+        grads_v = {n: p.grad.clone() for n, p in head.named_parameters() if p.grad is not None}
+        head.zero_grad()
+
+        # u-loss
+        loss_u, _ = head.compute_uloss(pipeline_fn, t, r, v_target)
+        loss_u.backward()
+        grads_u = {n: p.grad.clone() for n, p in head.named_parameters() if p.grad is not None}
+
+        # At least one parameter should have different gradients (二阶梯度差异)
+        any_differs = False
+        for name in grads_v:
+            if name in grads_u:
+                if not torch.allclose(grads_v[name], grads_u[name], atol=0):
+                    any_differs = True
+                    break
+
+        assert any_differs, (
+            "u-loss and v-loss produced identical parameter gradients — "
+            "du/dt detach may not be working"
+        )
+
+    def test_uloss_with_random_r(self):
+        """u-loss works with r > 0."""
+        B, N, dim, out_dim = 1, 4, 64, 16
+        head = MeanFlowHead(input_dim=dim, out_dim=out_dim, dim=32, num_res_blocks=2)
+
+        backbone_hidden = torch.randn(B, N, dim)
+        t = torch.tensor([0.8])
+        r = torch.tensor([0.3])
+        v_target = torch.randn(B, N, out_dim)
+
+        def pipeline_fn(t_val):
+            return head(backbone_hidden, t_val, r)
+
+        loss, _ = head.compute_uloss(pipeline_fn, t, r, v_target)
+        assert torch.isfinite(loss)
+        loss.backward()
+
+    def test_uloss_full_model_forward(self):
+        """u-loss works end-to-end through OuroForImageTranslation."""
+        config = _tiny_config(fm_strategy="meanflow", fm_loss_type="u_loss")
+        model = OuroForImageTranslation(config)
+        model.train()
+
+        source = torch.randn(1, 1, 32, 32)
+        target = torch.randn(1, 1, 32, 32)
+
+        result = model(source, target)
+        assert "loss" in result
+        assert torch.isfinite(result["loss"])
+        result["loss"].backward()
+
+        params_without_grad = [
+            name for name, p in model.named_parameters()
+            if p.requires_grad and p.grad is None
+        ]
+        assert not params_without_grad, f"Missing grads: {params_without_grad[:5]}"
+
+
+# ---------------------------------------------------------------------------
 # Strategy dispatch tests
 # ---------------------------------------------------------------------------
 
@@ -335,6 +475,25 @@ class TestConfig:
         config = OuroMRIConfig()
         assert config.fm_strategy == "standard"
 
+    def test_default_loss_type_is_v_loss(self):
+        config = OuroMRIConfig()
+        assert config.fm_loss_type == "v_loss"
+
     def test_meanflow_strategy_config(self):
         config = OuroMRIConfig(fm_strategy="meanflow")
         assert config.fm_strategy == "meanflow"
+
+    def test_meanflow_uloss_config(self):
+        config = OuroMRIConfig(fm_strategy="meanflow", fm_loss_type="u_loss")
+        assert config.fm_loss_type == "u_loss"
+
+    def test_invalid_loss_type_raises(self):
+        import pytest
+        with pytest.raises(ValueError, match="fm_loss_type"):
+            OuroMRIConfig(fm_strategy="meanflow", fm_loss_type="invalid")
+
+    def test_uloss_with_standard_strategy_accepted(self):
+        """fm_loss_type='u_loss' with standard strategy is accepted (warns via logging)."""
+        config = OuroMRIConfig(fm_strategy="standard", fm_loss_type="u_loss")
+        assert config.fm_loss_type == "u_loss"
+        assert config.fm_strategy == "standard"

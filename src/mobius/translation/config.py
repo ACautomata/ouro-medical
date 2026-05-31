@@ -66,6 +66,12 @@ class OuroMRIConfig(PretrainedConfig):
             - `"standard"`: x_0-prediction with MSE loss, multi-step Euler sampling.
             - `"meanflow"`: MeanFlow average velocity with v-loss (iMF-style),
               one-step sampling via the MeanFlow Identity.
+        fm_loss_type (`str`, *optional*, defaults to `"v_loss"`):
+            MeanFlow 损失函数类型，仅在 fm_strategy="meanflow" 时生效。
+            - `"v_loss"`: iMF 风格的 v-loss，对 du/dt 做 stop_gradient，
+              等价于回归瞬时速度 v = ε - x₀。
+            - `"u_loss"`: 原始 MF 论文的 u-loss，梯度流过 du/dt（二阶梯度），
+              目标为 u_tgt = v_gt - (t-r) * du/dt。
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
             The epsilon used by RMS normalization layers.
         attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -108,6 +114,7 @@ class OuroMRIConfig(PretrainedConfig):
         fm_steps: int = 50,
         fm_cfg_guidance_scale: float = 1.0,
         fm_strategy: str = "standard",
+        fm_loss_type: str = "v_loss",
         t_eps: float = 1e-6,
         rms_norm_eps: float = 1e-6,
         attention_dropout: float = 0.0,
@@ -121,6 +128,16 @@ class OuroMRIConfig(PretrainedConfig):
         if fm_strategy not in ("standard", "meanflow"):
             raise ValueError(
                 f"fm_strategy must be 'standard' or 'meanflow', got '{fm_strategy}'"
+            )
+
+        if fm_loss_type not in ("v_loss", "u_loss"):
+            raise ValueError(
+                f"fm_loss_type must be 'v_loss' or 'u_loss', got '{fm_loss_type}'"
+            )
+        if fm_strategy != "meanflow" and fm_loss_type != "v_loss":
+            logger.warning(
+                f"fm_loss_type='{fm_loss_type}' only applies when fm_strategy='meanflow'; "
+                f"current fm_strategy='{fm_strategy}' will ignore it."
             )
 
         self.image_size = image_size
@@ -141,6 +158,7 @@ class OuroMRIConfig(PretrainedConfig):
         self.fm_steps = fm_steps
         self.fm_cfg_guidance_scale = fm_cfg_guidance_scale
         self.fm_strategy = fm_strategy
+        self.fm_loss_type = fm_loss_type
         self.rms_norm_eps = rms_norm_eps
         self.attention_dropout = attention_dropout
         self.mlp_dropout = mlp_dropout

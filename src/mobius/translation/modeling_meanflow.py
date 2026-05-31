@@ -168,5 +168,43 @@ class MeanFlowHead(nn.Module):
         loss = F.mse_loss(V_theta, v_target)
         return loss, u
 
+    def compute_uloss(
+        self,
+        pipeline_fn,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        v_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute MeanFlow u-loss (原始 MF 论文，梯度流过 du/dt).
+
+        与 compute_vloss 的区别：不对 du/dt 做 stop_gradient，梯度完整
+        流过 JVP 计算的二阶路径。目标函数为：
+            u_tgt = v_gt - (t - r) * du/dt
+            loss  = ||u - u_tgt||²
+
+        由于 du/dt 未 detach，优化过程包含对 θ 的二阶梯度项。
+        这可能导致训练不稳定（iMF 论文推荐使用 v-loss 替代）。
+
+        Args:
+            pipeline_fn: function(t: [B]) -> u: [B, N, out_dim].
+                封装从 t 到平均速度 u 的完整前向传播。
+            t: [B] 终点时间步。
+            r: [B] 区间起点时间步。
+            v_target: [B, N, out_dim] 真实速度 (ε - x₀)。
+
+        Returns:
+            (loss, u) — loss 可微，u 为原始预测。
+        """
+        # Disable autocast for JVP precision (bf16 tangents lose precision)
+        with torch.amp.autocast(device_type=t.device.type, enabled=False):
+            u, du_dt = jvp(pipeline_fn, (t.float(),), (torch.ones_like(t).float(),))
+
+        # u-loss: target = v_gt - (t - r) * du/dt, 无 detach
+        dt = (t - r)
+        u_target = v_target - dt.view(-1, 1, 1) * du_dt
+
+        loss = F.mse_loss(u, u_target)
+        return loss, u
+
 
 __all__ = ["MeanFlowHead"]
