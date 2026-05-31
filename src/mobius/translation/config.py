@@ -115,6 +115,7 @@ class OuroMRIConfig(PretrainedConfig):
         fm_cfg_guidance_scale: float = 1.0,
         fm_strategy: str = "standard",
         fm_loss_type: str = "v_loss",
+        meanflow_r_zero_prob: float = 0.5,
         t_eps: float = 1e-6,
         rms_norm_eps: float = 1e-6,
         attention_dropout: float = 0.0,
@@ -159,6 +160,7 @@ class OuroMRIConfig(PretrainedConfig):
         self.fm_cfg_guidance_scale = fm_cfg_guidance_scale
         self.fm_strategy = fm_strategy
         self.fm_loss_type = fm_loss_type
+        self.meanflow_r_zero_prob = meanflow_r_zero_prob
         self.rms_norm_eps = rms_norm_eps
         self.attention_dropout = attention_dropout
         self.mlp_dropout = mlp_dropout

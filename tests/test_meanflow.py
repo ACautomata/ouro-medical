@@ -362,7 +362,7 @@ class TestStrategyDispatch:
 
         assert "loss" in result
         assert torch.isfinite(result["loss"])
-        assert "x_0_pred" in result
+        assert "x_r_pred" in result
 
     def test_meanflow_forward_backward(self):
         """MeanFlow loss backpropagates to all model parameters."""
@@ -497,3 +497,11 @@ class TestConfig:
         config = OuroMRIConfig(fm_strategy="standard", fm_loss_type="u_loss")
         assert config.fm_loss_type == "u_loss"
         assert config.fm_strategy == "standard"
+
+    def test_default_r_zero_prob(self):
+        config = OuroMRIConfig()
+        assert config.meanflow_r_zero_prob == 0.5
+
+    def test_custom_r_zero_prob(self):
+        config = OuroMRIConfig(meanflow_r_zero_prob=0.8)
+        assert config.meanflow_r_zero_prob == 0.8

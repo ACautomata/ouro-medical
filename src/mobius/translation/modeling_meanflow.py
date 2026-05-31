@@ -157,7 +157,8 @@ class MeanFlowHead(nn.Module):
         Returns:
             (loss, u) — loss is differentiable, u is the primal prediction.
         """
-        # Disable autocast for JVP precision (bf16 tangents lose precision)
+        # Disable autocast for JVP precision (bf16 tangents lose ~16% relative
+        # error on full model; FP32 JVP is required for correct du/dt).
         with torch.amp.autocast(device_type=t.device.type, enabled=False):
             u, du_dt = jvp(pipeline_fn, (t.float(),), (torch.ones_like(t).float(),))
 
@@ -165,7 +166,7 @@ class MeanFlowHead(nn.Module):
         dt = (t - r)
         V_theta = u + dt.view(-1, 1, 1) * du_dt.detach()
 
-        loss = F.mse_loss(V_theta, v_target)
+        loss = F.mse_loss(V_theta, v_target.float())
         return loss, u
 
     def compute_uloss(
@@ -195,13 +196,14 @@ class MeanFlowHead(nn.Module):
         Returns:
             (loss, u) — loss 可微，u 为原始预测。
         """
-        # Disable autocast for JVP precision (bf16 tangents lose precision)
+        # Disable autocast for JVP precision (bf16 tangents lose ~16% relative
+        # error on full model; FP32 JVP is required for correct du/dt).
         with torch.amp.autocast(device_type=t.device.type, enabled=False):
             u, du_dt = jvp(pipeline_fn, (t.float(),), (torch.ones_like(t).float(),))
 
         # u-loss: target = v_gt - (t - r) * du/dt, 无 detach
         dt = (t - r)
-        u_target = v_target - dt.view(-1, 1, 1) * du_dt
+        u_target = v_target.float() - dt.view(-1, 1, 1) * du_dt
 
         loss = F.mse_loss(u, u_target)
         return loss, u
