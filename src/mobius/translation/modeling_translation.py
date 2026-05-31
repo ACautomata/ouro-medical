@@ -191,9 +191,18 @@ class OuroForImageTranslation(PreTrainedModel):
         source_embeds = self.ve_proj(source_embeds)
         source_embeds = source_embeds.view(B, N_patches, self.hidden_size)
 
-        # --- Shared: create noisy target ---
+        # --- Shared: create noise ---
         target_patches = patchify(target_image, self.patch_size)
         noise = torch.randn_like(target_patches)
+
+        # --- Strategy-specific path ---
+        if self.fm_strategy == "meanflow":
+            return self._forward_meanflow(
+                source_embeds, target_patches, noise,
+                N_patches, B, C, H, W, t, grid_hw, device,
+            )
+
+        # --- Standard FM: encode noisy target and run backbone ---
         t_reshaped = t[:, None, None, None, None]
         noisy_patches = (1 - t_reshaped) * target_patches + t_reshaped * noise
 
@@ -208,7 +217,7 @@ class OuroForImageTranslation(PreTrainedModel):
         t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
         target_embeds = target_embeds + t_emb
 
-        # --- Shared: run backbone ---
+        # Run backbone
         combined_embeds = torch.cat([source_embeds, target_embeds], dim=1)
         outputs, hidden_states_list, gate_list = self.backbone(
             inputs_embeds=combined_embeds,
@@ -218,15 +227,9 @@ class OuroForImageTranslation(PreTrainedModel):
 
         pdf_list = self._compute_exit_pdf(gate_list, combined_embeds.shape[1], B, device)
 
-        # --- Strategy-specific loss ---
-        if self.fm_strategy == "meanflow":
-            return self._forward_meanflow(
-                hidden_states_list, pdf_list, N_patches, B, C, t, target_patches, noise, device,
-            )
-        else:
-            return self._forward_standard(
-                hidden_states_list, pdf_list, N_patches, B, C, t, target_patches,
-            )
+        return self._forward_standard(
+            hidden_states_list, pdf_list, N_patches, B, C, t, target_patches,
+        )
 
     def _forward_standard(
         self, hidden_states_list, pdf_list, N_patches, B, C, t, target_patches,
@@ -248,40 +251,86 @@ class OuroForImageTranslation(PreTrainedModel):
         return {"loss": loss, "x_0_pred": x_0_expected}
 
     def _forward_meanflow(
-        self, hidden_states_list, pdf_list, N_patches, B, C, t, target_patches, noise, device,
+        self, source_embeds, target_patches, noise,
+        N_patches, B, C, H, W, t, grid_hw, device,
     ) -> dict[str, torch.Tensor]:
-        """MeanFlow: combined hidden state → average velocity → v-loss via JVP."""
-        P = self.patch_size
+        """MeanFlow: JVP through full pipeline → v-loss.
 
-        # Weighted combination of hidden states across UT steps
-        combined_hidden = torch.zeros(B, N_patches, self.hidden_size, device=device)
-        for step_idx, hidden_states in enumerate(hidden_states_list):
-            target_hidden = hidden_states[:, N_patches:, :]
-            weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
-            combined_hidden = combined_hidden + weight * target_hidden
+        Defines a pipeline function f(t) → u that encapsulates the full
+        forward pass (VE → backbone → head), then uses JVP to compute the
+        total derivative du/dt for the MeanFlow Identity.
+
+        Note on JVP semantics: the tangent vector through z_t interpolation
+        equals dz_t/dt = eps - x_0 = v_gt (ground-truth velocity). This
+        follows the original MeanFlow formulation where the JVP uses v_gt,
+        not v_theta from an auxiliary head. The full iMF formulation would
+        require a separate v_theta prediction head.
+        """
+        P = self.patch_size
+        hidden_size = self.hidden_size
 
         # Sample interval start r
-        # With 50% probability use r=0 (enables one-step inference),
-        # otherwise sample r uniformly in [0, t)
         r = torch.zeros(B, device=device)
         random_mask = torch.rand(B, device=device) < 0.5
         r[random_mask] = torch.rand(random_mask.sum(), device=device) * t[random_mask]
 
         # Ground-truth velocity: v = ε - x_0 (constant for linear interpolation)
-        v_target = (noise - target_patches).view(B, N_patches, -1)  # [B, N, C*P*P]
+        v_target = (noise - target_patches).view(B, N_patches, -1)
 
-        # MeanFlow v-loss with JVP
-        loss, u_pred = self.diffusion_head.compute_vloss(combined_hidden, t, r, v_target)
+        # Capture float32 copies for JVP precision (M1)
+        source_f32 = source_embeds.float()
+        target_f32 = target_patches.float()
+        noise_f32 = noise.float()
 
-        # Also compute x_0 from u for logging: x_0 = x_t - (t-r) * u
-        dt = (t - r)
-        u_patches = u_pred.view(B, N_patches, C, P, P)
+        def pipeline_fn(t_val):
+            """Full model pipeline as a function of t."""
+            # Interpolate z_t from target and noise
+            t_r = t_val[:, None, None, None, None]
+            z_t = (1 - t_r) * target_f32 + t_r * noise_f32
+
+            # VE encode z_t
+            z_flat = z_t.view(B * N_patches, C, P, P)
+            tgt_embeds = self.ve(z_flat, grid_hw=grid_hw)
+            tgt_embeds = self.ve_proj(tgt_embeds)
+            tgt_embeds = tgt_embeds.view(B, N_patches, hidden_size)
+
+            # Timestep embedding for backbone conditioning
+            t_emb = self.backbone_timestep_embed(t_val)
+            t_emb = t_emb.unsqueeze(1).expand(-1, N_patches, -1)
+            tgt_embeds = tgt_embeds + t_emb
+
+            # Backbone (UT loop)
+            combined = torch.cat([source_f32, tgt_embeds], dim=1)
+            _outputs, hs_list, gate_list = self.backbone(
+                inputs_embeds=combined, attention_mask=None, use_cache=False,
+            )
+
+            # Exit PDF weighted combination of hidden states
+            pdf_list = self._compute_exit_pdf(gate_list, combined.shape[1], B, device)
+            combined_hidden = torch.zeros(B, N_patches, hidden_size, device=device)
+            for step_idx, hs in enumerate(hs_list):
+                target_hs = hs[:, N_patches:]
+                weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
+                combined_hidden = combined_hidden + weight * target_hs
+
+            # Head predicts average velocity u for interval [r, t]
+            u = self.diffusion_head(combined_hidden, t_val, r)
+            return u
+
+        # JVP through the full pipeline → correct total derivative
+        loss, u = self.diffusion_head.compute_vloss(pipeline_fn, t, r, v_target)
+
+        # x_r prediction for logging: x_r = x_t - (t-r) * u
+        # NOTE: This recovers the point at time r, NOT x_0, when r > 0.
+        # For r > 0, x_0 would require a second step: x_0 = x_r - r * u(x_r, 0, r).
+        # Currently only r=0 samples give valid x_0 predictions.
+        u_patches = u.view(B, N_patches, C, P, P)
         t_reshaped = t[:, None, None, None, None]
         noisy_patches = (1 - t_reshaped) * target_patches + t_reshaped * noise
-        dt_reshaped = dt[:, None, None, None, None]
-        x_0_pred = noisy_patches - dt_reshaped * u_patches
+        dt_reshaped = (t - r)[:, None, None, None, None]
+        x_r_pred = noisy_patches - dt_reshaped * u_patches
 
-        return {"loss": loss, "x_0_pred": x_0_pred}
+        return {"loss": loss, "x_0_pred": x_r_pred}
 
     @torch.no_grad()
     def translate(
@@ -393,9 +442,12 @@ class OuroForImageTranslation(PreTrainedModel):
         z = torch.randn(B, N_patches, C, P, P, device=device)
 
         # Split [0, 1] into num_steps intervals
+        # Process intervals in DESCENDING order: start from x_1 (noise at t=1),
+        # apply u for interval [t_{i+1}, t_i] to move backward toward x_0.
+        # MeanFlow Identity: x_r = x_t - (t - r) * u(x_t, r, t) where r < t.
         dt = 1.0 / num_steps
 
-        for i in range(num_steps):
+        for i in reversed(range(num_steps)):
             r_i = torch.full((B,), i * dt, device=device)
             t_i = torch.full((B,), (i + 1) * dt, device=device)
 
