@@ -277,16 +277,11 @@ class OuroForImageTranslation(PreTrainedModel):
         # Ground-truth velocity: v = ε - x_0 (constant for linear interpolation)
         v_target = (noise - target_patches).view(B, N_patches, -1)
 
-        # Capture float32 copies for JVP precision (M1)
-        source_f32 = source_embeds.float()
-        target_f32 = target_patches.float()
-        noise_f32 = noise.float()
-
         def pipeline_fn(t_val):
             """Full model pipeline as a function of t."""
             # Interpolate z_t from target and noise
             t_r = t_val[:, None, None, None, None]
-            z_t = (1 - t_r) * target_f32 + t_r * noise_f32
+            z_t = (1 - t_r) * target_patches + t_r * noise
 
             # VE encode z_t
             z_flat = z_t.view(B * N_patches, C, P, P)
@@ -300,14 +295,14 @@ class OuroForImageTranslation(PreTrainedModel):
             tgt_embeds = tgt_embeds + t_emb
 
             # Backbone (UT loop)
-            combined = torch.cat([source_f32, tgt_embeds], dim=1)
+            combined = torch.cat([source_embeds, tgt_embeds], dim=1)
             _outputs, hs_list, gate_list = self.backbone(
                 inputs_embeds=combined, attention_mask=None, use_cache=False,
             )
 
             # Exit PDF weighted combination of hidden states
             pdf_list = self._compute_exit_pdf(gate_list, combined.shape[1], B, device)
-            combined_hidden = torch.zeros(B, N_patches, hidden_size, device=device, dtype=source_f32.dtype)
+            combined_hidden = torch.zeros(B, N_patches, hidden_size, device=device, dtype=combined.dtype)
             for step_idx, hs in enumerate(hs_list):
                 target_hs = hs[:, N_patches:]
                 weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
