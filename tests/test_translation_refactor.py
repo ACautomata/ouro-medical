@@ -112,7 +112,8 @@ class TestBraTS2023DatasetSplit:
             _make_brats_structure(root, n_patients=1, n_slices=10)
             ds = BraTS2023Dataset(root, subtypes=["GLI"], normalize="minmax", split="train")
             sample = ds[0]
-            assert sample["source_image"].min() >= 0.0
+            # minmax normalization now maps to [-1, 1] for flow matching
+            assert sample["source_image"].min() >= -1.0
             assert sample["source_image"].max() <= 1.0
 
 
