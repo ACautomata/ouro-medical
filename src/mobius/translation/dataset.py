@@ -155,7 +155,8 @@ class BraTS2023Dataset(Dataset):
         if self.normalize == "minmax":
             vmin, vmax = data.min(), data.max()
             if vmax > vmin:
-                return (data - vmin) / (vmax - vmin)
+                # Map to [-1, 1] for flow matching compatibility
+                return 2.0 * (data - vmin) / (vmax - vmin) - 1.0
             return np.zeros_like(data)
         elif self.normalize == "zscore":
             mean, std = data.mean(), data.std()
