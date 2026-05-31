@@ -5,7 +5,9 @@ Configure via YAML config file — see configs/train_config.yaml for reference.
 """
 
 import argparse
+import json
 import math
+import os
 
 import lightning as L
 import lightning.pytorch.callbacks as pl_callbacks
@@ -80,6 +82,13 @@ def main():
     model = build_model(model_cfg)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+
+    # Save config.json for inference compatibility
+    output_dir = train_cfg.get("output_dir", "outputs")
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(model.config.to_dict(), f)
+    print(f"Saved config.json to {config_path}")
 
     # Datasets — created before module to compute exact training steps
     train_dataset = BraTS2023Dataset(

@@ -163,7 +163,7 @@ class MeanFlowHead(nn.Module):
 
         # MeanFlow Identity: V_θ = u + (t - r) · du/dt
         dt = (t - r)
-        V_theta = u + dt.view(-1, 1, 1) * du_dt
+        V_theta = u + dt.view(-1, 1, 1) * du_dt.detach()
 
         loss = F.mse_loss(V_theta, v_target)
         return loss, u

@@ -259,6 +259,12 @@ class OuroForImageTranslation(PreTrainedModel):
         Defines a pipeline function f(t) → u that encapsulates the full
         forward pass (VE → backbone → head), then uses JVP to compute the
         total derivative du/dt for the MeanFlow Identity.
+
+        Note on JVP semantics: the tangent vector through z_t interpolation
+        equals dz_t/dt = eps - x_0 = v_gt (ground-truth velocity). This
+        follows the original MeanFlow formulation where the JVP uses v_gt,
+        not v_theta from an auxiliary head. The full iMF formulation would
+        require a separate v_theta prediction head.
         """
         P = self.patch_size
         hidden_size = self.hidden_size
@@ -314,14 +320,17 @@ class OuroForImageTranslation(PreTrainedModel):
         # JVP through the full pipeline → correct total derivative
         loss, u = self.diffusion_head.compute_vloss(pipeline_fn, t, r, v_target)
 
-        # x_0 prediction for logging: x_0 = x_t - (t-r) * u  (valid when r=0)
+        # x_r prediction for logging: x_r = x_t - (t-r) * u
+        # NOTE: This recovers the point at time r, NOT x_0, when r > 0.
+        # For r > 0, x_0 would require a second step: x_0 = x_r - r * u(x_r, 0, r).
+        # Currently only r=0 samples give valid x_0 predictions.
         u_patches = u.view(B, N_patches, C, P, P)
         t_reshaped = t[:, None, None, None, None]
         noisy_patches = (1 - t_reshaped) * target_patches + t_reshaped * noise
         dt_reshaped = (t - r)[:, None, None, None, None]
-        x_0_pred = noisy_patches - dt_reshaped * u_patches
+        x_r_pred = noisy_patches - dt_reshaped * u_patches
 
-        return {"loss": loss, "x_0_pred": x_0_pred}
+        return {"loss": loss, "x_0_pred": x_r_pred}
 
     @torch.no_grad()
     def translate(
@@ -433,9 +442,12 @@ class OuroForImageTranslation(PreTrainedModel):
         z = torch.randn(B, N_patches, C, P, P, device=device)
 
         # Split [0, 1] into num_steps intervals
+        # Process intervals in DESCENDING order: start from x_1 (noise at t=1),
+        # apply u for interval [t_{i+1}, t_i] to move backward toward x_0.
+        # MeanFlow Identity: x_r = x_t - (t - r) * u(x_t, r, t) where r < t.
         dt = 1.0 / num_steps
 
-        for i in range(num_steps):
+        for i in reversed(range(num_steps)):
             r_i = torch.full((B,), i * dt, device=device)
             t_i = torch.full((B,), (i + 1) * dt, device=device)
 
