@@ -318,7 +318,10 @@ class OuroForImageTranslation(PreTrainedModel):
             return u
 
         # JVP through the full pipeline → correct total derivative
-        loss, u = self.diffusion_head.compute_vloss(pipeline_fn, t, r, v_target)
+        if self.config.fm_loss_type == "u_loss":
+            loss, u = self.diffusion_head.compute_uloss(pipeline_fn, t, r, v_target)
+        else:
+            loss, u = self.diffusion_head.compute_vloss(pipeline_fn, t, r, v_target)
 
         # x_r prediction for logging: x_r = x_t - (t-r) * u
         # NOTE: This recovers the point at time r, NOT x_0, when r > 0.
