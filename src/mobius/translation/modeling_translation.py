@@ -269,10 +269,10 @@ class OuroForImageTranslation(PreTrainedModel):
         P = self.patch_size
         hidden_size = self.hidden_size
 
-        # Sample interval start r
+        # Sample interval start r (50% r=0 for 1-step coverage, 50% r~U[0,t])
         r = torch.zeros(B, device=device)
-        random_mask = torch.rand(B, device=device) < 0.5
-        r[random_mask] = torch.rand(random_mask.sum(), device=device) * t[random_mask]
+        random_mask = torch.rand(B, device=device) < self.config.meanflow_r_zero_prob
+        r[~random_mask] = torch.rand((~random_mask).sum(), device=device) * t[~random_mask]
 
         # Ground-truth velocity: v = ε - x_0 (constant for linear interpolation)
         v_target = (noise - target_patches).view(B, N_patches, -1)
@@ -307,7 +307,7 @@ class OuroForImageTranslation(PreTrainedModel):
 
             # Exit PDF weighted combination of hidden states
             pdf_list = self._compute_exit_pdf(gate_list, combined.shape[1], B, device)
-            combined_hidden = torch.zeros(B, N_patches, hidden_size, device=device)
+            combined_hidden = torch.zeros(B, N_patches, hidden_size, device=device, dtype=source_f32.dtype)
             for step_idx, hs in enumerate(hs_list):
                 target_hs = hs[:, N_patches:]
                 weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
@@ -333,7 +333,7 @@ class OuroForImageTranslation(PreTrainedModel):
         dt_reshaped = (t - r)[:, None, None, None, None]
         x_r_pred = noisy_patches - dt_reshaped * u_patches
 
-        return {"loss": loss, "x_0_pred": x_r_pred}
+        return {"loss": loss, "x_r_pred": x_r_pred}
 
     @torch.no_grad()
     def translate(
@@ -446,7 +446,7 @@ class OuroForImageTranslation(PreTrainedModel):
 
         # Split [0, 1] into num_steps intervals
         # Process intervals in DESCENDING order: start from x_1 (noise at t=1),
-        # apply u for interval [t_{i+1}, t_i] to move backward toward x_0.
+        # apply u for interval [r_i, t_i] to move backward toward x_0.
         # MeanFlow Identity: x_r = x_t - (t - r) * u(x_t, r, t) where r < t.
         dt = 1.0 / num_steps
 
@@ -473,7 +473,7 @@ class OuroForImageTranslation(PreTrainedModel):
             pdf_list = self._compute_exit_pdf(gate_list, combined_embeds.shape[1], B, device)
 
             # Combine hidden states across UT steps
-            combined_hidden = torch.zeros(B, N_patches, self.hidden_size, device=device)
+            combined_hidden = torch.zeros(B, N_patches, self.hidden_size, device=device, dtype=source_embeds.dtype)
             for step_idx, hidden_states in enumerate(hidden_states_list):
                 target_hidden = hidden_states[:, N_patches:, :]
                 weight = pdf_list[step_idx][:, N_patches:].unsqueeze(-1)
@@ -483,11 +483,12 @@ class OuroForImageTranslation(PreTrainedModel):
             u = self.diffusion_head(combined_hidden, t_i, r_i)  # [B, N, C*P*P]
             u = u.view(B, N_patches, C, P, P)
 
-            # Update: x_r = x_t - (t - r) * u
-            z = z - dt * u
+            # Update: x_r = x_t - (t - r) * u  (explicit interval length)
+            z = z - (t_i - r_i).view(B, 1, 1, 1, 1) * u
 
             if verbose:
-                print(f"  Step {i+1}/{num_steps}, r={r_i[0]:.4f}, t={t_i[0]:.4f}")
+                step_num = num_steps - i
+                print(f"  Step {step_num}/{num_steps}, r={r_i[0]:.4f}, t={t_i[0]:.4f}")
 
         return unpatchify(z, P, H, W)
 
